@@ -1,0 +1,20 @@
+# Wireless Diagnostic Suite - Python dependencies
+# Verified on macOS with Python 3.12.3
+# Install with:  pip3 install -r requirements.txt
+#
+# NOTE: pyobjc frameworks (CoreWLAN) are macOS-only. This tool runs on macOS.
+
+# --- WiFi scanning (macOS CoreWLAN bridge) ---
+pyobjc==11.0
+
+# --- Internet speed testing ---
+speedtest-cli==2.1.3
+
+# --- Plotting / heatmaps ---
+matplotlib==3.8.2
+numpy==1.26.3
+scipy==1.16.0
+Pillow==10.2.0
+
+# --- PDF report generation ---
+reportlab==4.3.0
