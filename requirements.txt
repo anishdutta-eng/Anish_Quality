@@ -1,5 +1,5 @@
 # Wireless Diagnostic Suite - Python dependencies
-# Verified on macOS with Python 3.12.3
+# Verified on macOS with Python 3.12
 # Install with:  pip3 install -r requirements.txt
 #
 # NOTE: pyobjc frameworks (CoreWLAN) are macOS-only. This tool runs on macOS.
@@ -18,3 +18,10 @@ Pillow==10.2.0
 
 # --- PDF report generation ---
 reportlab==4.3.0
+
+# --- Interactive offline viewer & survey heatmaps ---
+plotly==5.18.0
+
+# --- Machine learning (quality scoring & anomaly detection) ---
+scikit-learn==1.4.0
+joblib==1.5.3
