@@ -48,8 +48,12 @@ if [ ! -x "$VENV_PY" ]; then
 fi
 
 # --- 3. Verify dependencies; install if anything is missing ---
-# Check a few representative modules. If any is missing, (re)install.
-if ! "$VENV_PY" -c "import speedtest, numpy, matplotlib, scipy, reportlab, plotly, sklearn" 2>/dev/null; then
+# Check the REQUIRED modules only. CoreWLAN is the macOS WiFi binding the tool
+# needs; sklearn/joblib are optional (only the offline viewer uses them) so they
+# must NOT gate this check, otherwise a failed optional install would make the
+# launcher re-download everything on every start.
+REQUIRED_IMPORTS="import speedtest, numpy, matplotlib, scipy, reportlab, plotly, CoreWLAN"
+if ! "$VENV_PY" -c "$REQUIRED_IMPORTS" 2>/dev/null; then
     echo "Installing what the tool needs (one time, a few minutes)..."
     echo ""
     "$VENV_PY" -m pip install --upgrade pip >/dev/null
@@ -61,10 +65,10 @@ if ! "$VENV_PY" -c "import speedtest, numpy, matplotlib, scipy, reportlab, plotl
         exit 1
     fi
     # Verify again
-    if ! "$VENV_PY" -c "import speedtest, numpy, matplotlib, scipy, reportlab, plotly, sklearn" 2>/dev/null; then
+    if ! "$VENV_PY" -c "$REQUIRED_IMPORTS" 2>/dev/null; then
         echo ""
         echo "ERROR: Some dependencies are still missing after install."
-        "$VENV_PY" -c "import speedtest, numpy, matplotlib, scipy, reportlab, plotly, sklearn" 2>&1 | tail -3
+        "$VENV_PY" -c "$REQUIRED_IMPORTS" 2>&1 | tail -3
         read -p "Press Enter to close..."
         exit 1
     fi

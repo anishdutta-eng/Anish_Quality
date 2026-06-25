@@ -8,7 +8,11 @@
 # NOTE: pyobjc frameworks (CoreWLAN) are macOS-only. This tool runs on macOS.
 
 # --- WiFi scanning (macOS CoreWLAN bridge) ---
-pyobjc>=10.0
+# Only the CoreWLAN binding is used. Do NOT depend on the full "pyobjc"
+# umbrella — it pulls ~200 framework wheels (Vision, VideoToolbox, etc.) and
+# makes startup download hundreds of MB every time. This single package pulls
+# just its small deps (pyobjc-core, pyobjc-framework-Cocoa).
+pyobjc-framework-CoreWLAN>=10.0
 
 # --- Internet speed testing ---
 speedtest-cli>=2.1

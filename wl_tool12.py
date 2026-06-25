@@ -504,37 +504,83 @@ def get_ssid():
     except Exception as e:
         return "SSID Not Available"
 
-def get_bssid():
-    """Get current AP BSSID (MAC address) for roaming detection - with sudo"""
+# ===== wdutil info cache =====
+# `sudo wdutil info` is expensive: it spawns sudo and queries the wireless
+# driver, taking a noticeable fraction of a second each call. The live sampling
+# loop used to invoke it 8-9 times PER ITERATION (a separate shell pipeline per
+# metric: RSSI, Tx, MCS, Noise, Channel, PHY, NSS, CCA, BSSID, Guard Interval).
+# That subprocess storm is what made the machine hang. We now run it ONCE per
+# iteration and parse every field from the cached text.
+_wdutil_cache = {"text": "", "ts": 0.0}
+# How long a single `wdutil info` snapshot may be reused. Short enough that each
+# new survey point / loop iteration gets fresh data, long enough that the ~10
+# metric reads taken at one moment all share a single subprocess.
+_WDUTIL_TTL = 1.0
+
+def refresh_wdutil_info():
+    """Force a fresh `sudo wdutil info` read and cache the full output.
+
+    Called at the top of each sampling iteration (live loop) and before each
+    sample (survey mode); every get_* helper below then parses the cached text
+    instead of shelling out again.
+    """
     try:
-        # Method 1: wdutil with sudo (most reliable)
-        bssid = subprocess.check_output(
-            "sudo wdutil info | grep 'BSSID' | awk '{print $3}' 2>/dev/null",
-            shell=True, universal_newlines=True, timeout=5, stderr=subprocess.DEVNULL
-        ).strip()
-        if bssid and bssid != "<redacted>" and len(bssid) > 5:
-            return bssid
-        
-        # Method 2: airport command (if available) - suppress errors
-        try:
-            bssid = subprocess.check_output(
-                "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -I 2>/dev/null | awk '/ BSSID/ {print $2}'",
-                shell=True, universal_newlines=True, timeout=5, stderr=subprocess.DEVNULL
-            ).strip()
-            if bssid and len(bssid) > 5:
-                return bssid
-        except:
-            pass
-        
-        # Method 3: CoreWLAN
+        _wdutil_cache["text"] = subprocess.check_output(
+            "sudo wdutil info",
+            shell=True, universal_newlines=True, timeout=8,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        _wdutil_cache["text"] = ""
+    _wdutil_cache["ts"] = time.time()
+    return _wdutil_cache["text"]
+
+def _wdutil_text():
+    """Return cached wdutil output, auto-refreshing when empty or stale.
+
+    The TTL keeps every metric read taken at one moment on a single snapshot
+    (one subprocess) while still giving each new survey point or loop iteration
+    fresh data — so callers outside the live loop (e.g. wl_survey) stay correct
+    without having to manage the cache themselves.
+    """
+    if (not _wdutil_cache["text"]
+            or (time.time() - _wdutil_cache["ts"]) > _WDUTIL_TTL):
+        return refresh_wdutil_info()
+    return _wdutil_cache["text"]
+
+def _wdutil_field(needle):
+    """Value after the first ':' on the first line containing `needle`.
+
+    Mirrors the old `grep '<needle>' | cut -d ':' -f2` pipelines.
+    """
+    for line in _wdutil_text().splitlines():
+        if needle in line:
+            parts = line.split(":", 1)
+            return parts[1].strip() if len(parts) > 1 else ""
+    return ""
+
+def get_bssid():
+    """Get current AP BSSID (MAC address) for roaming detection."""
+    try:
+        # Primary: parse the cached `wdutil info` output (BSSID line, 3rd token).
+        for line in _wdutil_text().splitlines():
+            if "BSSID" in line:
+                toks = line.split()
+                if len(toks) >= 3:
+                    bssid = toks[2].strip()
+                    if bssid and bssid != "<redacted>" and len(bssid) > 5:
+                        return bssid
+                break
+
+        # Fallback: CoreWLAN (no subprocess).
         try:
             import CoreWLAN
             iface = CoreWLAN.CWInterface.interface()
             if iface and iface.bssid():
                 return iface.bssid()
-        except:
+        except Exception:
             pass
-        
+
         return "Unknown"
     except Exception:
         return "Unknown"
@@ -547,11 +593,7 @@ def get_noise_floor():
     the wrong field), which then produces wildly wrong SNR. Reject those.
     """
     try:
-        noise = subprocess.check_output(
-            "sudo wdutil info | grep 'Noise' | cut -d ':' -f2",
-            shell=True, universal_newlines=True, timeout=5
-        ).strip()
-        val = extract_value(noise)
+        val = extract_value(_wdutil_field("Noise"))
         if val is None:
             return None
         # Noise floor must be negative and within a physically sane range.
@@ -563,10 +605,7 @@ def get_noise_floor():
 
 def get_wifi_channel():
     try:
-        channel = subprocess.check_output(
-            "sudo wdutil info | grep 'Channel' | cut -d ':' -f2",
-            shell=True, universal_newlines=True, timeout=5
-        ).strip()
+        channel = _wdutil_field("Channel")
         return str(channel)[:9] if channel else "Unknown"
     except Exception:
         return "Unknown"
@@ -577,28 +616,16 @@ def extract_value(value):
 
 def get_mcs_index():
     try:
-        mcs = subprocess.check_output(
-            "sudo wdutil info | grep 'MCS Index' | cut -d ':' -f2",
-            shell=True, universal_newlines=True, timeout=5
-        ).strip()
-        m = re.search(r"\d+", mcs)
+        m = re.search(r"\d+", _wdutil_field("MCS Index"))
         return int(m.group(0)) if m else None
     except Exception:
         return None
 
 def get_wifi_stats():
     try:
-        rssi = subprocess.check_output(
-            "sudo wdutil info | egrep RSSI | cut -d ':' -f2",
-            shell=True, universal_newlines=True, timeout=5
-        ).strip()
-        tx_rate = subprocess.check_output(
-            "sudo wdutil info | egrep Tx | cut -d ':' -f2",
-            shell=True, universal_newlines=True, timeout=5
-        ).strip()
         return {
-            "RSSI": extract_value(rssi),
-            "Tx Rate": extract_value(tx_rate),
+            "RSSI": extract_value(_wdutil_field("RSSI")),
+            "Tx Rate": extract_value(_wdutil_field("Tx")),
             "MCS Index": get_mcs_index()
         }
     except Exception as e:
@@ -606,8 +633,10 @@ def get_wifi_stats():
 
 def run_ping_test():
     try:
+        # Two quick pings keep the per-iteration latency probe under ~1-2s
+        # instead of the ~5s that `ping -c 5` cost on every single sample.
         out = subprocess.check_output(
-            "ping -c 5 google.com",
+            "ping -c 2 -t 3 google.com",
             shell=True, universal_newlines=True, timeout=5
         )
         for line in out.splitlines():
@@ -622,30 +651,21 @@ def run_ping_test():
 
 def get_phy():
     try:
-        phy = subprocess.check_output(
-            "sudo wdutil info | grep 'PHY ' | cut -d ':' -f2",
-            shell=True, universal_newlines=True, timeout=5
-        ).strip()
+        phy = _wdutil_field("PHY ")
         return phy or "Unknown"
     except Exception:
         return "Unknown"
 
 def get_nss():
     try:
-        nss = subprocess.check_output(
-            "sudo wdutil info | grep 'NSS' | cut -d ':' -f2",
-            shell=True, universal_newlines=True, timeout=5
-        ).strip()
+        nss = _wdutil_field("NSS")
         return nss or "Unknown"
     except Exception:
         return "Unknown"
 
 def get_channel_utilization():
     try:
-        utilization = subprocess.check_output(
-            "sudo wdutil info | grep 'CCA' | cut -d ':' -f2",
-            shell=True, universal_newlines=True, timeout=5
-        ).strip()
+        utilization = _wdutil_field("CCA")
         match = re.search(r"(\d+)%", utilization)
         return int(match.group(1)) if match else utilization
     except Exception as e:
@@ -818,10 +838,7 @@ def get_real_throughput():
 def get_guard_interval():
     """Get the current 802.11ax Guard Interval in nanoseconds from wdutil."""
     try:
-        out = subprocess.check_output(
-            "sudo wdutil info | grep 'Guard Interval' | cut -d ':' -f2",
-            shell=True, universal_newlines=True, timeout=5).strip()
-        m = re.search(r'\d+', out)
+        m = re.search(r'\d+', _wdutil_field("Guard Interval"))
         return int(m.group(0)) if m else 800
     except Exception:
         return 800  # Default to 0.8µs
@@ -920,6 +937,94 @@ def calculate_80211ax_phy_rate(mcs, nss, bw_mhz, gi_ns=800):
         )
     })
     return result
+
+
+# ===== HOME / 4K-STREAMING PERFORMANCE MODEL =====
+# A practical "good home WiFi" yardstick: smooth 4K (UHD) video streaming needs
+# a sustained throughput of ~25 Mbps (a widely cited minimum, e.g. Netflix's 4K
+# recommendation). We translate the RF link metrics into an ESTIMATED achievable
+# TCP throughput, then grade that against the 25 Mbps 4K floor so a coverage map
+# shows where a home would actually stream 4K reliably.
+FOURK_MIN_MBPS = 25.0       # sustained throughput needed for smooth 4K
+HOME_TARGET_MBPS = 150.0    # headroom target that maps to a top score / "excellent"
+
+def estimate_achievable_throughput(rssi, snr, mcs, nss, bw_mhz=80, gi_ns=800):
+    """Estimate real-world achievable TCP throughput (Mbps) from link metrics.
+
+    throughput = PHY_rate(MCS, NSS, BW, GI) × MAC/TCP efficiency × reliability
+
+      - PHY_rate: 802.11ax formula — modulation/coding from MCS, spatial streams
+        from NSS, subcarriers from bandwidth, symbol time from the guard interval.
+      - efficiency (~0.65): real TCP goodput after MAC/IP/ACK/inter-frame overhead.
+      - reliability ∈ [0,1]: weak RSSI or low SNR force retries and rate back-off,
+        so we derate. SNR and RSSI are combined with the worse one dominating.
+
+    Returns estimated Mbps (float), or None when MCS is unavailable.
+    """
+    if mcs is None:
+        return None
+    nss = int(nss) if (nss and nss >= 1) else 1
+    calc = calculate_80211ax_phy_rate(int(round(mcs)), nss, bw_mhz, gi_ns)
+    phy = calc.get('phy_rate_mbps') or 0.0
+    if phy <= 0:
+        return 0.0
+
+    efficiency = 0.65
+
+    def _ramp(v, lo, hi):
+        if v is None:
+            return 0.7  # neutral assumption when a metric is missing
+        if hi == lo:
+            return 1.0
+        return max(0.0, min(1.0, (v - lo) / (hi - lo)))
+
+    # SNR: <=10 dB unreliable, >=30 dB clean  -> 0.25 .. 1.0
+    snr_factor = 0.25 + 0.75 * _ramp(snr, 10.0, 30.0)
+    # RSSI: <=-80 dBm poor, >=-60 dBm strong  -> 0.30 .. 1.0
+    rssi_factor = 0.30 + 0.70 * _ramp(rssi, -80.0, -60.0)
+    reliability = min(snr_factor, rssi_factor)
+
+    return round(phy * efficiency * reliability, 1)
+
+
+def home_performance(rssi, snr, mcs, nss, bw_mhz=80, gi_ns=800):
+    """Grade a measurement for 'best home performance', anchored to 4K streaming.
+
+    Returns a dict:
+      throughput_mbps : estimated achievable TCP throughput
+      score           : 0-100 (60 == exactly the 25 Mbps 4K floor)
+      streams_4k      : how many simultaneous 25 Mbps 4K streams it sustains
+      capable_4k      : bool — throughput >= 25 Mbps
+      label           : short human-readable verdict
+    """
+    tput = estimate_achievable_throughput(rssi, snr, mcs, nss, bw_mhz, gi_ns)
+    if tput is None:
+        return {"throughput_mbps": None, "score": None, "streams_4k": None,
+                "capable_4k": None, "label": "no data"}
+
+    if tput <= 0:
+        score = 0.0
+    elif tput < FOURK_MIN_MBPS:
+        # Below the 4K floor -> 0..60 (cannot stream 4K smoothly)
+        score = 60.0 * (tput / FOURK_MIN_MBPS)
+    else:
+        # At/above the floor -> 60..100 scaled by headroom up to the target
+        head = (tput - FOURK_MIN_MBPS) / (HOME_TARGET_MBPS - FOURK_MIN_MBPS)
+        score = 60.0 + 40.0 * max(0.0, min(1.0, head))
+
+    capable = tput >= FOURK_MIN_MBPS
+    streams = tput / FOURK_MIN_MBPS
+    if not capable:
+        label = "Below 4K"
+    elif streams >= 4:
+        label = "Excellent (multi-4K)"
+    elif streams >= 2:
+        label = "Great (2+ 4K)"
+    else:
+        label = "4K-ready"
+
+    return {"throughput_mbps": tput, "score": round(score, 1),
+            "streams_4k": round(streams, 1), "capable_4k": capable, "label": label}
 
 
 def get_speedtest():
@@ -1674,69 +1779,44 @@ def scan_networks_summary():
 def network_sanity_check():
     global sanity_check_passed
     print_header("🔍 Network Sanity Check")
-    print_info("Performing network sanity check. Please wait...")
-    
-    attempts = 0
-    max_attempts = 2  # Reduced attempts for sanity check
-    speedtest_worked = False
-    
-    while attempts < max_attempts and not speedtest_worked:
-        ping, download, upload = get_speedtest()
-        if download is not None and upload is not None:
-            speedtest_worked = True
-            sanity_check_passed = True
-            print_success("Network sanity check passed!")
-            print_metric("  Ping", f"{ping:.1f}", " ms", Colors.PURPLE)
-            print_metric("  Download", f"{download:.2f}", " Mbps", Colors.GREEN)
-            print_metric("  Upload", f"{upload:.2f}", " Mbps", Colors.GREEN)
-            
-            summary = scan_networks_summary()
-            if summary:
-                print(f"\n{Colors.BOLD}📡 Nearby Wi-Fi Summary:{Colors.ENDC}")
-                for band in ("2.4GHz","5GHz","6GHz"):
-                    s = summary[band]
-                    band_color = Colors.ORANGE if band == "2.4GHz" else Colors.PURPLE if band == "5GHz" else Colors.VIOLET
-                    print(f"  {band_color}{band}:{Colors.ENDC} {s['count']} networks | "
-                          f"Least: {Colors.GREEN}Ch {s['least_crowded_channel']}{Colors.ENDC} | "
-                          f"Most: {Colors.RED}Ch {s['most_crowded_channel']}{Colors.ENDC}")
-            return True
-        attempts += 1
-        if attempts < max_attempts:
-            print_warning(f"Sanity check attempt {attempts} failed, retrying...")
-            time.sleep(2)
-    
-    # If speedtest failed, check basic connectivity
-    if not speedtest_worked:
-        print_warning("Speedtest unavailable - checking basic connectivity...")
+    print_info("Checking connectivity...")
+
+    # A full download+upload speedtest here used to add 30-60s of startup
+    # latency before the test could even begin — and its numbers were never
+    # stored or used in the report (only the pass/fail boolean is). So we now
+    # confirm connectivity with a fast TCP probe. A full speedtest is still
+    # available on demand during the live loop (every 10th iteration).
+    reachable = False
+    for host, port in (("8.8.8.8", 53), ("1.1.1.1", 53), ("google.com", 443)):
         try:
-            # Try ping to google.com
-            result = subprocess.run(['ping', '-c', '3', 'google.com'], 
-                                  capture_output=True, timeout=5, text=True)
-            if result.returncode == 0:
-                sanity_check_passed = True
-                print_success("Basic internet connectivity confirmed (ping successful)")
-                print_info("Continuing without speedtest - WiFi diagnostics will still work")
-                
-                # Show network summary
-                summary = scan_networks_summary()
-                if summary:
-                    print(f"\n{Colors.BOLD}📡 Nearby Wi-Fi Summary:{Colors.ENDC}")
-                    for band in ("2.4GHz","5GHz","6GHz"):
-                        s = summary[band]
-                        band_color = Colors.ORANGE if band == "2.4GHz" else Colors.PURPLE if band == "5GHz" else Colors.VIOLET
-                        print(f"  {band_color}{band}:{Colors.ENDC} {s['count']} networks | "
-                              f"Least: {Colors.GREEN}Ch {s['least_crowded_channel']}{Colors.ENDC} | "
-                              f"Most: {Colors.RED}Ch {s['most_crowded_channel']}{Colors.ENDC}")
-                return True
-        except Exception as e:
-            print_warning(f"Ping test also failed: {str(e)[:50]}")
-    
+            with contextlib.closing(socket.create_connection((host, port), timeout=2)):
+                reachable = True
+                break
+        except Exception:
+            continue
+
+    if reachable:
+        sanity_check_passed = True
+        print_success("Internet connectivity confirmed.")
+
+        summary = scan_networks_summary()
+        if summary:
+            print(f"\n{Colors.BOLD}📡 Nearby Wi-Fi Summary:{Colors.ENDC}")
+            for band in ("2.4GHz","5GHz","6GHz"):
+                s = summary[band]
+                band_color = Colors.ORANGE if band == "2.4GHz" else Colors.PURPLE if band == "5GHz" else Colors.VIOLET
+                print(f"  {band_color}{band}:{Colors.ENDC} {s['count']} networks | "
+                      f"Least: {Colors.GREEN}Ch {s['least_crowded_channel']}{Colors.ENDC} | "
+                      f"Most: {Colors.RED}Ch {s['most_crowded_channel']}{Colors.ENDC}")
+        print_info("Tip: enter 'y' at the speedtest prompt during the test for a full speed measurement.")
+        return True
+
     sanity_check_passed = False
     print_error("Network connectivity check failed")
-    print_info("You can still run diagnostics, but speedtest will be skipped")
-    
+    print_info("You can still run diagnostics, but internet-dependent features will be skipped")
+
     # Ask user if they want to continue
-    response = input(f"\n{Colors.BOLD}{Colors.PURPLE}Continue without speedtest? (y/n): {Colors.ENDC}").strip().lower()
+    response = input(f"\n{Colors.BOLD}{Colors.PURPLE}Continue anyway? (y/n): {Colors.ENDC}").strip().lower()
     if response == 'y':
         sanity_check_passed = True  # Allow continuation
     return response == 'y'
@@ -3090,8 +3170,12 @@ def plot_live_diagnostics(sample_interval):
     # Clean, minimal style
     plt.style.use('seaborn-v0_8-whitegrid')
     
-    # Presentation-quality layout: generous spacing, large figure
-    fig = plt.figure(figsize=(20, 42), dpi=150, facecolor='white')
+    # Presentation-quality layout: generous spacing, large figure.
+    # dpi is kept modest for the *interactive* canvas (this figure is ~20x42in;
+    # at 150 dpi that is a ~19 MP canvas redrawn every iteration, which is slow
+    # and memory-heavy). Saved PNGs below still pass dpi=150 explicitly, so
+    # exported image quality is unchanged.
+    fig = plt.figure(figsize=(20, 42), dpi=100, facecolor='white')
     gs = gridspec.GridSpec(8, 2, 
                            height_ratios=[1, 1, 1, 1, 1, 1.2, 1, 0.5],
                            hspace=0.55, wspace=0.40,
@@ -3125,7 +3209,7 @@ def plot_live_diagnostics(sample_interval):
     fig_subtitle = fig.text(0.5, 0.978, subtitle, ha='center', fontsize=12, color='#7F8C8D', style='italic')
 
     # ===== Separate Coverage Window =====
-    fig_cov = plt.figure(figsize=(14, 7), dpi=150, facecolor='white', num='WiFi Coverage Map')
+    fig_cov = plt.figure(figsize=(14, 7), dpi=100, facecolor='white', num='WiFi Coverage Map')
     gs_cov = gridspec.GridSpec(1, 2, wspace=0.35)
     ax_cov_heatmap = fig_cov.add_subplot(gs_cov[0, 0])
     ax_cov_zones = fig_cov.add_subplot(gs_cov[0, 1])
@@ -3340,6 +3424,11 @@ def plot_live_diagnostics(sample_interval):
 
         now = time.time() - start
         x_vals.append(now)
+
+        # Single wdutil snapshot for this whole iteration. Every get_* metric
+        # helper below reads from this cache instead of spawning its own
+        # `sudo wdutil info` subprocess (was 8-9 shells per iteration).
+        refresh_wdutil_info()
 
         if iteration % 5 == 0:
             cached_ssid = get_ssid()
@@ -3565,7 +3654,7 @@ def plot_live_diagnostics(sample_interval):
                 update_heatmap_plot(ax_heatmap, ax_coverage)
                 # Also update the separate coverage window
                 update_heatmap_plot(ax_cov_heatmap, ax_cov_zones)
-                fig_cov.canvas.draw()
+                fig_cov.canvas.draw_idle()
                 fig_cov.canvas.flush_events()
             except Exception as e:
                 pass  # Silently handle interpolation errors during early iterations
@@ -3795,7 +3884,7 @@ def plot_live_diagnostics(sample_interval):
                     ax8.text(i, cnt + 0.5, f"{cnt} networks\nLeast: Ch {ch}", 
                             ha='center', va='bottom', fontsize=8, color='#2C3E50')
 
-        fig.canvas.draw()
+        fig.canvas.draw_idle()
         fig.canvas.flush_events()
         time.sleep(sample_interval)
 
@@ -3966,7 +4055,16 @@ def plot_live_diagnostics(sample_interval):
         plt.close(fig_cov)
     except Exception:
         pass
-    
+
+    # Close the main live figure. It was never closed before, so in comparative
+    # mode (plot_live_diagnostics is called twice) the giant figures piled up in
+    # memory. Drop all live figures now that everything is saved.
+    try:
+        plt.close(fig)
+        plt.close('all')
+    except Exception:
+        pass
+
     # Print final summary with colors
     print_header("📊 FINAL DIAGNOSTIC SUMMARY")
     print_metric("  Total iterations", iteration, "", Colors.PURPLE)

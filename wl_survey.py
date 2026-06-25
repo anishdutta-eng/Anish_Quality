@@ -19,6 +19,7 @@ import sys
 import json
 import base64
 import time
+import re
 from datetime import datetime
 
 import numpy as np
@@ -32,7 +33,8 @@ try:
         get_wifi_stats, get_noise_floor, get_phy, get_nss,
         get_channel_utilization, get_bssid, get_ssid, get_wifi_channel,
         get_guard_interval, calculate_80211ax_phy_rate, estimate_distance,
-        compute_network_score,
+        compute_network_score, refresh_wdutil_info,
+        estimate_achievable_throughput, home_performance, FOURK_MIN_MBPS,
     )
     _HAVE_TOOL = True
 except Exception as e:
@@ -70,6 +72,100 @@ EKAHAU_PLOTLY = [
     [0.50, "#FFD400"], [0.66, "#C8E000"], [0.82, "#46C300"],
     [1.00, "#00A300"],
 ]
+
+
+# ===== 4K / HOME-PERFORMANCE COLOR MAP =====
+# For the estimated-throughput map the colour breakpoint sits at the 4K floor
+# (25 Mbps). With vmin=0 / vmax=100 Mbps, position 0.25 == 25 Mbps: red/orange
+# below it (cannot stream 4K), green above (4K-ready with headroom).
+FOURK_VMAX_MBPS = 100.0
+_fk = lambda mbps: max(0.0, min(1.0, mbps / FOURK_VMAX_MBPS))
+FOURK_CMAP = LinearSegmentedColormap.from_list("home4k", [
+    (0.00,            "#B00000"),  # 0 Mbps    — dead
+    (_fk(12),         "#FF2A00"),  # 12 Mbps   — very poor
+    (_fk(24.99),      "#FF7A00"),  # just under 4K floor — orange
+    (_fk(25),         "#FFD400"),  # 25 Mbps   — exactly the 4K floor (yellow)
+    (_fk(50),         "#9ACD32"),  # 50 Mbps   — comfortable
+    (_fk(75),         "#46C300"),  # 75 Mbps   — great
+    (1.00,            "#00A300"),  # >=100 Mbps — excellent headroom
+])
+FOURK_PLOTLY = [
+    [0.00, "#B00000"], [_fk(12), "#FF2A00"], [_fk(24.99), "#FF7A00"],
+    [_fk(25), "#FFD400"], [_fk(50), "#9ACD32"], [_fk(75), "#46C300"],
+    [1.00, "#00A300"],
+]
+
+
+def band_channel_label(chan_str):
+    """Parse a wdutil channel string into (band_label, channel_number, bandwidth_mhz).
+
+    Handles macOS wdutil forms like '6g149/160', '5g36/80', '2g6/20', and bare
+    channel numbers. Returns e.g. ("5 GHz", 36, 80). Unknown parts come back None.
+    """
+    s = str(chan_str or "").strip()
+    m = re.search(r'(\d+)\s*[gG]\s*(\d+)(?:\s*/\s*(\d+))?', s)
+    if m:
+        ghz, ch = m.group(1), int(m.group(2))
+        bw = int(m.group(3)) if m.group(3) else None
+        band = {"2": "2.4 GHz", "5": "5 GHz", "6": "6 GHz"}.get(ghz, f"{ghz} GHz")
+        return band, ch, bw
+    # Fallback: a bare channel number
+    m2 = re.search(r'(\d+)', s)
+    if not m2:
+        return ("Unknown", None, None)
+    ch = int(m2.group(1))
+    band = "6 GHz" if ch > 165 else "5 GHz" if ch > 14 else "2.4 GHz"
+    bw = next((b for b in (160, 80, 40, 20) if str(b) in s), None)
+    return band, ch, bw
+
+
+def band_channel_summary(chan_str):
+    """Human-readable one-liner, e.g. '5 GHz · Ch 36 · 80 MHz'."""
+    band, ch, bw = band_channel_label(chan_str)
+    parts = [band]
+    if ch is not None:
+        parts.append(f"Ch {ch}")
+    if bw:
+        parts.append(f"{bw} MHz")
+    return " · ".join(parts)
+
+
+# ===== AP MOUNT PROFILES =====
+# Mount placement changes the real coverage shape. Ceiling/overhead mounting
+# (facing down) is the recommended practice and radiates fairly evenly outward;
+# a desk/table-top unit pushes energy into the horizontal plane where furniture,
+# monitors and people block it, creating shadow zones and shorter range.
+# (Refs: Cisco Catalyst 9100 deployment guide; Sophos AP mounting guide; WLAN
+# Professionals. Path-loss exponent ~2.0 line-of-sight vs ~2.4-3.5 obstructed —
+# Virginia Tech indoor measurements. Content rephrased for compliance.)
+#
+# We translate this into the survey map by:
+#   - path_loss_exp : reference propagation exponent for interpretation,
+#   - radius_frac   : how far from a sample we trust interpolation (fraction of
+#                     the smaller floor-plan dimension). Table-top sees sharper
+#                     local variation, so we trust a smaller radius,
+#   - note          : a plain-language caveat printed on the map/report.
+MOUNT_PROFILES = {
+    "ceiling": {
+        "label": "Ceiling / overhead mount",
+        "path_loss_exp": 2.2,
+        "radius_frac": 0.22,
+        "note": ("Overhead mount: signal radiates fairly evenly outward — expect "
+                 "smooth, roughly circular coverage around the AP."),
+    },
+    "tabletop": {
+        "label": "Table-top / desk mount",
+        "path_loss_exp": 3.2,
+        "radius_frac": 0.14,
+        "note": ("Desk mount: energy is pushed into the horizontal plane where "
+                 "furniture, screens and people block it — expect shadow zones and "
+                 "shorter range. Sample more densely near obstructions."),
+    },
+}
+
+def mount_profile(mount_key):
+    """Return the MOUNT_PROFILES entry for a key, defaulting to ceiling."""
+    return MOUNT_PROFILES.get(mount_key or "ceiling", MOUNT_PROFILES["ceiling"])
 
 
 # ===== PHASE 1: AP + POINT PLACEMENT =====
@@ -189,6 +285,10 @@ def measure_point(samples=3, sample_delay=1.0):
     gi = get_guard_interval()
 
     for s in range(samples):
+        # Take a fresh wdutil snapshot for THIS sample so the averaged samples
+        # (and every survey point) reflect real, distinct readings rather than a
+        # single cached snapshot.
+        refresh_wdutil_info()
         stats = get_wifi_stats()
         if "Error" in stats:
             print(f"   Measurement error: {stats['Error']}")
@@ -252,6 +352,13 @@ def measure_point(samples=3, sample_delay=1.0):
     score, _ = compute_network_score(rssi=avg_rssi, snr=avg_snr, mcs=avg_mcs,
                                      tx_rate=avg_tx, phy_rate=phy_rate)
 
+    # Home / 4K-streaming performance: estimated achievable throughput from
+    # (RSSI, SNR, MCS, NSS) graded against the 25 Mbps 4K floor.
+    hp = home_performance(
+        avg_rssi, avg_snr,
+        int(round(avg_mcs)) if avg_mcs is not None else None,
+        nss_int, bw, gi)
+
     return {
         "rssi": avg_rssi,
         "snr": avg_snr,
@@ -260,8 +367,14 @@ def measure_point(samples=3, sample_delay=1.0):
         "channel_util": _avg(cu_vals),
         "phy_rate": phy_rate,
         "score": score,
+        "throughput": hp["throughput_mbps"],   # est. achievable Mbps (4K model)
+        "home_score": hp["score"],             # 0-100, 60 == 25 Mbps 4K floor
+        "streams_4k": hp["streams_4k"],        # simultaneous 25 Mbps 4K streams
+        "home_label": hp["label"],
+        "capable_4k": hp["capable_4k"],
         "phy_mode": str(phy) if phy else "",
         "nss": nss_int,
+        "bw": bw,
         "samples": len(rssi_vals),
     }
 
@@ -485,12 +598,17 @@ def coverage_mask(points_xy, grid_x, grid_y, radius_px):
 
 def generate_heatmap(measurements, img, w_px, h_px, output_png,
                      metric="rssi", title="WiFi Coverage Heatmap",
-                     ap_xy=None, planned_points=None):
+                     ap_xy=None, planned_points=None,
+                     info_line=None, mount=None):
     """
     Build a smooth IDW heatmap overlaid on the floor plan and save as PNG.
 
     If ap_xy / planned_points are given, the AP (gold star), the planned walk
     path, and any skipped stops (orange) are drawn for visual context.
+
+    info_line : optional string (band / channel / SSID) drawn as a subtitle.
+    mount     : optional MOUNT_PROFILES key ('ceiling'/'tabletop'); adjusts how
+                far interpolation is trusted and adds a caveat to the subtitle.
     """
     valid = [m for m in measurements if m.get(metric) is not None]
     if len(valid) < 2:
@@ -509,9 +627,12 @@ def generate_heatmap(measurements, img, w_px, h_px, output_png,
     # Smooth RBF surface that passes through measured points (Ekahau/Hamina-style)
     zi = interpolate_surface(pts_xy, vals, gx, gy)
 
-    # Fade out areas far from any measurement (don't fabricate coverage)
-    # Radius scales with the floor plan size; ~18% of the smaller dimension.
-    radius_px = 0.18 * min(w_px, h_px)
+    # Fade out areas far from any measurement (don't fabricate coverage).
+    # Radius scales with the floor plan size. Mount type tunes how far we trust
+    # interpolation: a table-top AP varies sharply around clutter, so we trust a
+    # smaller radius; a ceiling AP is smoother, so we trust a wider one.
+    radius_frac = mount_profile(mount)["radius_frac"] if mount else 0.18
+    radius_px = radius_frac * min(w_px, h_px)
     mask = coverage_mask(pts_xy, gx, gy, radius_px)
     zi = np.where(mask, np.nan, zi)
 
@@ -523,6 +644,10 @@ def generate_heatmap(measurements, img, w_px, h_px, output_png,
         cmap = EKAHAU_CMAP
         vmin, vmax = 0, 100     # composite network performance score
         cbar_label = "Performance Score (0-100)"
+    elif metric == "throughput":
+        cmap = FOURK_CMAP
+        vmin, vmax = 0, FOURK_VMAX_MBPS   # 25 Mbps = 4K floor (yellow breakpoint)
+        cbar_label = "Est. Throughput (Mbps) — 4K needs \u2265 25"
     elif metric == "rssi":
         cmap = EKAHAU_CMAP
         vmin, vmax = -80, -45   # -45 dBm+ = best green, -80 dBm = dead red
@@ -546,6 +671,16 @@ def generate_heatmap(measurements, img, w_px, h_px, output_png,
     # Smooth filled contour overlay — higher opacity for clear zone reading
     cf = ax.contourf(gx, gy, zi, levels=100, cmap=cmap, alpha=0.7,
                      vmin=vmin, vmax=vmax, zorder=1, extend="both")
+
+    # On the 4K map, draw the 25 Mbps boundary so the pass/fail line is explicit.
+    if metric == "throughput":
+        try:
+            cs = ax.contour(gx, gy, zi, levels=[FOURK_MIN_MBPS],
+                            colors="#1A1A2E", linewidths=1.4, linestyles="--",
+                            zorder=2)
+            ax.clabel(cs, fmt={FOURK_MIN_MBPS: "4K floor (25 Mbps)"}, fontsize=7)
+        except Exception:
+            pass
 
     # Planned walk path (faint guide line through planned stops, in order)
     if planned_points and len(planned_points) > 1:
@@ -582,7 +717,23 @@ def generate_heatmap(measurements, img, w_px, h_px, output_png,
     cbar = fig.colorbar(cf, ax=ax, shrink=0.6, pad=0.02)
     cbar.set_label(cbar_label, fontsize=11)
 
-    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=26)
+
+    # Subtitle: frequency band / channel (feature 1) + AP mount caveat (feature 3)
+    sub_parts = []
+    if info_line:
+        sub_parts.append(info_line)
+    if mount:
+        sub_parts.append(mount_profile(mount)["label"])
+    if sub_parts:
+        ax.text(0.5, 1.015, "   ·   ".join(sub_parts), transform=ax.transAxes,
+                ha="center", va="bottom", fontsize=10, color="#34495E",
+                fontweight="bold")
+    if mount:
+        ax.text(0.5, -0.02, mount_profile(mount)["note"], transform=ax.transAxes,
+                ha="center", va="top", fontsize=7.5, color="#7F8C8D",
+                style="italic", wrap=True)
+
     ax.axis("off")
     ax.set_xlim(0, w_px)
     ax.set_ylim(h_px, 0)
@@ -696,8 +847,8 @@ def generate_survey_pdf(measurements, name, out_dir, output_pdf,
 
     info = [
         ["Survey name", name, "Date", datetime.now().strftime("%Y-%m-%d %H:%M")],
-        ["AP model", meta.get("ap_model", "—"), "Tester", meta.get("tester", "—")],
-        ["SSID", meta.get("ssid", "—"), "Band", meta.get("band", "—")],
+        ["AP model", meta.get("ap_model", "—"), "AP mount", meta.get("mount_label", "—")],
+        ["SSID", meta.get("ssid", "—"), "Band / channel", meta.get("band", "—")],
         ["Points planned", str(n_planned), "Points measured", str(n_measured)],
         ["Points skipped", str(n_skipped), "Samples/point", meta.get("samples", "—")],
     ]
@@ -726,6 +877,13 @@ def generate_survey_pdf(measurements, name, out_dir, output_pdf,
         if sc_avg is not None else "No scored measurements collected.", body))
     story.append(Spacer(1, 0.1*inch))
 
+    # AP mount context (feature 3) — how to read the coverage shape.
+    if meta.get("mount_note"):
+        story.append(Paragraph(
+            f"<i>AP mount: <b>{meta.get('mount_label', '—')}</b> — "
+            f"{meta['mount_note']}</i>", small))
+        story.append(Spacer(1, 0.1*inch))
+
     # Band distribution
     band_counts = {b[0]: 0 for b in _SCORE_BANDS}
     for m in measured:
@@ -748,6 +906,35 @@ def generate_survey_pdf(measurements, name, out_dir, output_pdf,
         band_style.append(("FONTNAME", (0, i), (0, i), "Helvetica-Bold"))
     bt.setStyle(TableStyle(band_style))
     story.append(bt)
+    story.append(Spacer(1, 0.15*inch))
+
+    # ---- Home / 4K streaming performance (feature 2) ----
+    story.append(Paragraph("Home Performance — 4K Streaming Readiness", h2))
+    story.append(Paragraph(
+        "Smooth 4K (UHD) video needs a sustained <b>25 Mbps</b>. We estimate the "
+        "achievable TCP throughput at each point as a function of RSSI, SNR, MCS "
+        "and NSS (PHY rate × efficiency × signal-reliability), then check it "
+        "against that 4K floor:", body))
+    tputs = [m.get("throughput") for m in measured if m.get("throughput") is not None]
+    n_tput = len(tputs)
+    if n_tput:
+        n_4k = sum(1 for t in tputs if t >= FOURK_MIN_MBPS)
+        pct_4k = 100.0 * n_4k / n_tput
+        avg_tput = sum(tputs) / n_tput
+        min_tput = min(tputs)
+        max_tput = max(tputs)
+        story.append(Paragraph(
+            f"<b>{n_4k}/{n_tput}</b> measured points ({pct_4k:.0f}%) can stream 4K "
+            f"(\u2265 25 Mbps). Estimated throughput averages <b>{avg_tput:.0f} Mbps</b> "
+            f"(range {min_tput:.0f}–{max_tput:.0f} Mbps).", body))
+        if pct_4k < 100:
+            weak4k = [m for m in measured
+                      if m.get("throughput") is not None and m["throughput"] < FOURK_MIN_MBPS]
+            ids = ", ".join(f"#{m['point']}" for m in weak4k)
+            story.append(Paragraph(
+                f"⚠ Points below the 4K floor: {ids}.", body))
+    else:
+        story.append(Paragraph("No throughput estimates available.", body))
     story.append(Spacer(1, 0.15*inch))
 
     # Key findings
@@ -779,7 +966,8 @@ def generate_survey_pdf(measurements, name, out_dir, output_pdf,
                  _row("SNR (dB)", "snr", "dB"),
                  _row("MCS", "mcs", "", "{:.0f}"),
                  _row("Tx rate (Mbps)", "tx_rate", "Mbps", "{:.0f}"),
-                 _row("PHY rate (Mbps)", "phy_rate", "Mbps", "{:.0f}")]
+                 _row("PHY rate (Mbps)", "phy_rate", "Mbps", "{:.0f}"),
+                 _row("Est. 4K throughput (Mbps)", "throughput", "Mbps", "{:.0f}")]
     st = Table(stat_rows, colWidths=[1.7*inch, 1.0*inch, 1.0*inch, 1.0*inch, 1.0*inch])
     st.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2C3E50")),
@@ -793,9 +981,10 @@ def generate_survey_pdf(measurements, name, out_dir, output_pdf,
 
     # ---- Heatmaps ----
     heatmap_paths = heatmap_paths or {}
-    titles = {"score": "Network Performance Score", "rssi": "RSSI Coverage",
-              "mcs": "MCS Coverage"}
-    for key in ("score", "rssi", "mcs"):
+    titles = {"score": "Network Performance Score",
+              "throughput": "Home Performance — 4K Streaming (\u2265 25 Mbps)",
+              "rssi": "RSSI Coverage", "mcs": "MCS Coverage"}
+    for key in ("score", "throughput", "rssi", "mcs"):
         p = heatmap_paths.get(key)
         if p and os.path.exists(p):
             story.append(PageBreak())
@@ -851,6 +1040,16 @@ def generate_survey_pdf(measurements, name, out_dir, output_pdf,
     if mcs_avg is not None and mcs_avg < 7:
         recs.append(f"Average MCS {mcs_avg:.1f} is below 7 (256-QAM) — the link is "
                     "not reaching high modulation; check RF conditions.")
+    if meta.get("mount") == "tabletop":
+        recs.append("AP is desk/table-top mounted — raising it higher or moving to a "
+                    "ceiling/wall mount usually removes furniture shadow zones and "
+                    "gives more uniform radial coverage.")
+    # 4K-specific recommendation
+    _t = [m.get("throughput") for m in measured if m.get("throughput") is not None]
+    if _t and any(t < FOURK_MIN_MBPS for t in _t):
+        recs.append("Some areas fall below the 25 Mbps 4K-streaming floor — consider "
+                    "a mesh node or a 5/6 GHz, wider-channel link to lift throughput "
+                    "in those zones.")
     if not recs:
         recs.append("Coverage looks healthy. Re-survey periodically to catch drift.")
     for r in recs:
@@ -874,12 +1073,13 @@ def generate_survey_pdf(measurements, name, out_dir, output_pdf,
 
 # Metric configs: key -> (label, colorscale_reversed, vmin, vmax, unit)
 _METRIC_CFG = {
-    "score":     ("Performance", False,   0, 100, ""),
-    "rssi":      ("RSSI",       False, -80, -45, "dBm"),
-    "snr":       ("SNR",        False,  15,  35, "dB"),
-    "mcs":       ("MCS Index",  False,   2,  11, ""),
-    "tx_rate":   ("Tx Rate",    False,   0, None, "Mbps"),
-    "phy_rate":  ("PHY Rate",   False,   0, None, "Mbps"),
+    "score":      ("Performance",     False,   0, 100, ""),
+    "throughput": ("Home 4K Mbps",    False,   0, 100, "Mbps"),
+    "rssi":       ("RSSI",            False, -80, -45, "dBm"),
+    "snr":        ("SNR",             False,  15,  35, "dB"),
+    "mcs":        ("MCS Index",       False,   2,  11, ""),
+    "tx_rate":    ("Tx Rate",         False,   0, None, "Mbps"),
+    "phy_rate":   ("PHY Rate",        False,   0, None, "Mbps"),
 }
 
 
@@ -903,7 +1103,8 @@ def _build_metric_grid(measurements, w_px, h_px, metric, grid_res=120):
 
 
 def generate_interactive_html(measurements, img_path, w_px, h_px,
-                              output_html, title="WiFi Survey Heatmap", ap_xy=None):
+                              output_html, title="WiFi Survey Heatmap", ap_xy=None,
+                              info_line=None):
     """
     Generate a self-contained interactive HTML heatmap (Hamina-style).
 
@@ -928,6 +1129,7 @@ def generate_interactive_html(measurements, img_path, w_px, h_px,
             grids[key] = {
                 "x": g[0], "y": g[1], "z": g[2],
                 "label": label, "vmin": vmin, "vmax": vmax, "unit": unit,
+                "colorscale": (FOURK_PLOTLY if key == "throughput" else EKAHAU_PLOTLY),
             }
 
     if not grids:
@@ -939,6 +1141,7 @@ def generate_interactive_html(measurements, img_path, w_px, h_px,
         "point": m["point"], "x": m["x_px"], "y": m["y_px"],
         "rssi": m.get("rssi"), "snr": m.get("snr"), "mcs": m.get("mcs"),
         "tx_rate": m.get("tx_rate"), "phy_rate": m.get("phy_rate"),
+        "throughput": m.get("throughput"), "home_label": m.get("home_label"),
     } for m in measurements]
 
     # Plotly.js source for offline embedding
@@ -972,6 +1175,7 @@ def generate_interactive_html(measurements, img_path, w_px, h_px,
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f8f9fa;color:#2c3e50}
 .header{background:#1a1a2e;color:#fff;padding:16px 24px;display:flex;justify-content:space-between;align-items:center}
 .header h1{font-size:18px;font-weight:600}
+.header .subtitle{font-size:12px;color:#9fb3c8;margin-top:3px;font-weight:500}
 .controls{display:flex;gap:8px}
 .controls button{padding:8px 16px;border:none;border-radius:20px;background:#34495e;color:#fff;cursor:pointer;font-size:13px;font-weight:500}
 .controls button.active{background:#3498db}
@@ -981,7 +1185,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 #heatmap{width:100%}
 </style></head><body>
 <div class="header">
-  <h1>__TITLE__</h1>
+  <div><h1>__TITLE__</h1><div class="subtitle">__SUBTITLE__</div></div>
   <div class="controls" id="metric-buttons"></div>
 </div>
 <div class="content">
@@ -999,7 +1203,7 @@ function render() {
   // Smooth IDW contour overlay
   traces.push({
     type: 'contour', x: g.x, y: g.y, z: g.z,
-    colorscale: DATA.colorscale, zmin: g.vmin, zmax: g.vmax,
+    colorscale: (g.colorscale || DATA.colorscale), zmin: g.vmin, zmax: g.vmax,
     opacity: 0.75, contours: {coloring: 'heatmap'},
     line: {width: 0}, ncontours: 80, zsmooth: 'best',
     colorbar: {title: g.label + (g.unit ? ' (' + g.unit + ')' : ''), len: 0.7},
@@ -1020,7 +1224,9 @@ function render() {
         'RSSI: ' + (p.rssi!=null?p.rssi.toFixed(1)+' dBm':'N/A') + '<br>' +
         'SNR: ' + (p.snr!=null?p.snr.toFixed(1)+' dB':'N/A') + '<br>' +
         'MCS: ' + (p.mcs!=null?p.mcs.toFixed(0):'N/A') + '<br>' +
-        'Tx: ' + (p.tx_rate!=null?p.tx_rate.toFixed(0)+' Mbps':'N/A') +
+        'Tx: ' + (p.tx_rate!=null?p.tx_rate.toFixed(0)+' Mbps':'N/A') + '<br>' +
+        'Home 4K: ' + (p.throughput!=null?p.throughput.toFixed(0)+' Mbps':'N/A') +
+        (p.home_label?' ('+p.home_label+')':'') +
         '<extra></extra>'),
       showlegend: false,
     });
@@ -1088,6 +1294,7 @@ render();
 
     html_doc = (html_doc
                 .replace("__TITLE__", safe_title)
+                .replace("__SUBTITLE__", _html.escape(info_line or ""))
                 .replace("__PLOTLY_JS__", plotly_js)
                 .replace("__PAYLOAD__", payload))
 
@@ -1219,19 +1426,38 @@ def _render_survey_outputs(measurements, fp, img, w_px, h_px, name, out_dir,
                            open_browser=True, ap_xy=None, planned_points=None,
                            meta=None):
     """Render all heatmaps + JSON + interactive HTML + PDF for one measurement set."""
+    meta = meta or {}
+    mount = meta.get("mount")
+    # Band / channel + SSID line shown on top of every plot (feature 1).
+    info_bits = []
+    if meta.get("band") and meta["band"] != "—":
+        info_bits.append(meta["band"])
+    if meta.get("ssid") and meta["ssid"] != "—":
+        info_bits.append(f"SSID {meta['ssid']}")
+    info_line = "   ·   ".join(info_bits) if info_bits else None
+
     print(f"\nGenerating heatmaps for '{name}'...")
     score_png = os.path.join(out_dir, f"heatmap_score_{name}.png")
+    home_png = os.path.join(out_dir, f"heatmap_home4k_{name}.png")
     rssi_png = os.path.join(out_dir, f"heatmap_rssi_{name}.png")
     mcs_png = os.path.join(out_dir, f"heatmap_mcs_{name}.png")
     generate_heatmap(measurements, img, w_px, h_px, score_png,
                      metric="score", title=f"Network Performance Score — {name}",
-                     ap_xy=ap_xy, planned_points=planned_points)
+                     ap_xy=ap_xy, planned_points=planned_points,
+                     info_line=info_line, mount=mount)
+    generate_heatmap(measurements, img, w_px, h_px, home_png,
+                     metric="throughput",
+                     title=f"Home Performance — 4K Streaming (\u2265 25 Mbps) — {name}",
+                     ap_xy=ap_xy, planned_points=planned_points,
+                     info_line=info_line, mount=mount)
     generate_heatmap(measurements, img, w_px, h_px, rssi_png,
                      metric="rssi", title=f"RSSI Coverage — {name}",
-                     ap_xy=ap_xy, planned_points=planned_points)
+                     ap_xy=ap_xy, planned_points=planned_points,
+                     info_line=info_line, mount=mount)
     generate_heatmap(measurements, img, w_px, h_px, mcs_png,
                      metric="mcs", title=f"MCS Coverage — {name}",
-                     ap_xy=ap_xy, planned_points=planned_points)
+                     ap_xy=ap_xy, planned_points=planned_points,
+                     info_line=info_line, mount=mount)
     save_survey_data(measurements, fp, w_px, h_px,
                      os.path.join(out_dir, f"survey_{name}.json"))
 
@@ -1240,12 +1466,13 @@ def _render_survey_outputs(measurements, fp, img, w_px, h_px, name, out_dir,
         measurements, name, out_dir,
         os.path.join(out_dir, f"survey_report_{name}.pdf"),
         ap_xy=ap_xy, planned_points=planned_points, meta=meta,
-        heatmap_paths={"score": score_png, "rssi": rssi_png, "mcs": mcs_png})
+        heatmap_paths={"score": score_png, "throughput": home_png,
+                       "rssi": rssi_png, "mcs": mcs_png})
 
     html_path = generate_interactive_html(
         measurements, fp, w_px, h_px,
         os.path.join(out_dir, f"survey_{name}.html"),
-        title=f"WiFi Survey — {name}", ap_xy=ap_xy)
+        title=f"WiFi Survey — {name}", ap_xy=ap_xy, info_line=info_line)
     if html_path and open_browser:
         import webbrowser
         webbrowser.open(f"file://{os.path.abspath(html_path)}")
@@ -1391,21 +1618,42 @@ def main():
 
     # --- Optional report metadata ---
     ap_model = input("AP model (e.g. eero Max 7, or Enter to skip): ").strip()
+
+    # AP mount type — changes the expected coverage shape on the map.
+    print("\nAP mount type (affects how coverage is interpreted):")
+    print("  1. Ceiling / overhead  — radiates evenly, roughly circular coverage")
+    print("  2. Table-top / desk    — blocked by furniture/screens, shadow zones")
+    try:
+        mount_in = input("Select (1/2, Enter = 1): ").strip()
+    except EOFError:
+        mount_in = "1"
+    mount_key = "tabletop" if mount_in == "2" else "ceiling"
+    mprof = mount_profile(mount_key)
+    print(f"  → {mprof['label']}: {mprof['note']}")
+
     tester = input("Tester name (or Enter to skip): ").strip()
     site = input("Site/location (or Enter to use survey name): ").strip()
-    ssid = band = ""
+    ssid = ""
+    chan_raw = ""
     try:
         if _HAVE_TOOL:
             ssid = get_ssid() or ""
-            band = str(get_wifi_channel() or "")
+            chan_raw = str(get_wifi_channel() or "")
     except Exception:
         pass
+    band_label, channel_num, bw_mhz = band_channel_label(chan_raw)
     meta = {
         "ap_model": ap_model or "—",
         "tester": tester or "—",
         "site": site or test_name,
         "ssid": ssid or "—",
-        "band": band or "—",
+        "band": band_channel_summary(chan_raw) if chan_raw else "—",
+        "band_label": band_label,
+        "channel": channel_num,
+        "bw": bw_mhz,
+        "mount": mount_key,
+        "mount_label": mprof["label"],
+        "mount_note": mprof["note"],
     }
 
     # --- Phase 1: place AP + points (shared by both devices in comparison mode) ---
