@@ -25,15 +25,19 @@ fi
 echo "Found: pip3"
 echo ""
 
-# --- Resolve script directory so this works from anywhere ---
+# --- Resolve paths so this works from anywhere ---
+# This script lives in <project_root>/app/. The virtual environment is created
+# at the PROJECT ROOT (one level up) so it matches the one the one-click
+# launcher uses, and so a single .venv serves the whole project.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # --- Recommend a virtual environment (optional but cleaner) ---
 echo "Creating a local virtual environment (.venv)..."
-python3 -m venv "$SCRIPT_DIR/.venv"
+python3 -m venv "$PROJECT_ROOT/.venv"
 # shellcheck disable=SC1091
-source "$SCRIPT_DIR/.venv/bin/activate"
-echo "Activated: $SCRIPT_DIR/.venv"
+source "$PROJECT_ROOT/.venv/bin/activate"
+echo "Activated: $PROJECT_ROOT/.venv"
 echo ""
 
 # --- Install dependencies from the pinned requirements file ---
@@ -48,13 +52,15 @@ echo "=================================================="
 echo "Installation Complete"
 echo "=================================================="
 echo ""
-echo "To run the tool:"
-echo "    source .venv/bin/activate      # if not already active"
-echo "    sudo python3 wl_tool12.py      # sudo gives full wireless access"
+echo "Easiest: just double-click 'Start WiFi Tool.command' in the project folder."
+echo ""
+echo "Or from the project root in a terminal:"
+echo "    source .venv/bin/activate          # if not already active"
+echo "    sudo python3 app/wl_tool12.py      # sudo gives full wireless access"
 echo ""
 echo "Note: 'sudo' may bypass the virtual environment. If you hit"
 echo "'ModuleNotFoundError' under sudo, run instead:"
-echo "    sudo .venv/bin/python wl_tool12.py"
+echo "    sudo .venv/bin/python app/wl_tool12.py"
 echo ""
-echo "Documentation: README.md, START_HERE.md, QUICK_START.md"
+echo "Documentation: README.md and the docs/ folder."
 echo "=================================================="

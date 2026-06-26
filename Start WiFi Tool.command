@@ -17,9 +17,9 @@ echo "=================================================="
 echo ""
 
 # --- 0. Make sure we're in the real package folder ---
-if [ ! -f "requirements.txt" ] || [ ! -f "wl_tool12.py" ]; then
-    echo "ERROR: This launcher must stay inside the WiFiDiagnosticSuite folder."
-    echo "       (requirements.txt and wl_tool12.py must be next to it.)"
+if [ ! -f "app/requirements.txt" ] || [ ! -f "app/wl_tool12.py" ]; then
+    echo "ERROR: This launcher must stay in the project folder, next to the 'app' folder."
+    echo "       (app/requirements.txt and app/wl_tool12.py must exist.)"
     echo ""
     echo "Current folder: $(pwd)"
     echo ""
@@ -57,7 +57,7 @@ if ! "$VENV_PY" -c "$REQUIRED_IMPORTS" 2>/dev/null; then
     echo "Installing what the tool needs (one time, a few minutes)..."
     echo ""
     "$VENV_PY" -m pip install --upgrade pip >/dev/null
-    if ! "$VENV_PY" -m pip install -r requirements.txt; then
+    if ! "$VENV_PY" -m pip install -r app/requirements.txt; then
         echo ""
         echo "ERROR: Dependency installation failed. Check your internet connection"
         echo "       and try again."
@@ -85,9 +85,18 @@ echo "Starting the WiFi tool..."
 echo "(You may be asked for your Mac password — this lets the tool read WiFi details.)"
 echo ""
 
+# Keep all generated output in one tidy place: <project>/Results/.
+# We run the tool from inside Results/ so every RUN_/SURVEY_/COMPARATIVE folder
+# it creates lands there instead of cluttering the project root.
+PROJECT_ROOT="$(pwd)"
+mkdir -p "$PROJECT_ROOT/Results"
+
 # wl_tool12.py needs sudo for full WiFi telemetry via wdutil.
-# Use the venv's python so dependencies are available under sudo.
-sudo "$VENV_PY" wl_tool12.py
+# Use the venv's python so dependencies are available under sudo. The script is
+# referenced by absolute path; cwd is Results/ so outputs collect there. The
+# code finds the default floor plan via the project's floorplans/ folder.
+cd "$PROJECT_ROOT/Results" || exit 1
+sudo "$VENV_PY" "$PROJECT_ROOT/app/wl_tool12.py"
 
 echo ""
 echo "=================================================="

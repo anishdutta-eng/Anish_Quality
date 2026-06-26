@@ -1309,10 +1309,15 @@ render();
 # ===== MAIN WORKFLOW =====
 
 def _default_floorplan_path():
-    """Path to the bundled default floor plan (next to this script)."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    cand = os.path.join(here, "default_floorplan.png")
-    return cand if os.path.exists(cand) else "default_floorplan.png"
+    """Path to the bundled default floor plan in the project's floorplans/ folder.
+
+    Floor plans live in <project_root>/floorplans/ (one level up from this app/
+    folder), giving users one obvious place to keep the default and their own.
+    """
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(app_dir)
+    cand = os.path.join(project_root, "floorplans", "default_floorplan.png")
+    return cand if os.path.exists(cand) else cand
 
 
 def _convert_pdf_to_png(pdf_path):
@@ -1377,12 +1382,14 @@ def choose_floorplan():
     """
     default_path = _default_floorplan_path()
     has_default = os.path.exists(default_path)
+    floorplans_dir = os.path.dirname(default_path)
 
     print("\nFloor plan:")
     print("  1. Browse…  (open a Finder window to pick the image/PDF)")
     if has_default:
         print("  2. Use the built-in default plan")
     print("  3. Type or drag-and-drop a file path")
+    print(f"  (Tip: keep your own floor plans in  {floorplans_dir}  for easy reuse.)")
 
     try:
         choice = input("Select (1/2/3, Enter = Browse): ").strip()

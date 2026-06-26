@@ -322,7 +322,13 @@ floorplan_config = {
 
 # Default floor plan: eero office at 16780 Lark Ave, Los Gatos
 # AP location: 2nd table from right, next to CENTO 5
+# Floor plans live in the project's "floorplans/" folder (one level up from this
+# app/ folder), so users have a single, obvious place to drop their own plans.
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_APP_DIR)
+_FLOORPLANS_DIR = os.path.join(_PROJECT_ROOT, 'floorplans')
 _DEFAULT_FLOORPLAN = 'default_floorplan.png'
+_DEFAULT_FLOORPLAN_PATH = os.path.join(_FLOORPLANS_DIR, _DEFAULT_FLOORPLAN)
 _DEFAULT_FP_WIDTH = 30.0
 _DEFAULT_FP_HEIGHT = 30.3
 _DEFAULT_AP_X = 19.5
@@ -1940,9 +1946,8 @@ def setup_floorplan(test_folder):
     """
     global floorplan_config
     
-    # Look for default floor plan in the script directory
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_path = os.path.join(script_dir, _DEFAULT_FLOORPLAN)
+    # Default floor plan lives in the project's floorplans/ folder
+    default_path = _DEFAULT_FLOORPLAN_PATH
     
     # Also check test folder for a custom floor plan
     custom_in_folder = None
@@ -2044,7 +2049,7 @@ def setup_floorplan(test_folder):
             print_warning("Skipping floor plan")
     else:
         print_info("No floor plan available — using radial heatmap")
-        print_info(f"  To use one, place '{_DEFAULT_FLOORPLAN}' in {script_dir}")
+        print_info(f"  To use one, place '{_DEFAULT_FLOORPLAN}' in {_FLOORPLANS_DIR}")
     
     # Walk path selection — always shown
     print()

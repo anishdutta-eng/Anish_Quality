@@ -72,28 +72,41 @@ This comprehensive diagnostic tool provides real-time wireless network analysis 
 - **sudo privileges** (required for wdutil commands and BSSID retrieval)
 
 ### Python Dependencies
-```bash
-pip install pyobjc speedtest-cli matplotlib reportlab
-```
+Installed automatically by the launcher or `bash app/setup.sh` (from `app/requirements.txt`).
 
 ## 🚀 Quick Start
 
-1. **Install dependencies:**
+**Easiest (no terminal):** double-click **`Start WiFi Tool.command`** in the project folder. The first run sets up everything automatically, then launches the tool. All output is saved under the `Results/` folder.
+
+**From a terminal instead:**
+
+1. **Install dependencies (one time):**
 ```bash
-pip install pyobjc speedtest-cli matplotlib reportlab
+bash app/setup.sh
 ```
 
 2. **Run the tool:**
 ```bash
-python3 wl_tool12.py
+sudo python3 app/wl_tool12.py
 ```
 
 3. **Follow the prompts:**
-   - Enter test name (creates RUN_<testname> folder)
+   - Pick mode 1 (Live Diagnostics) or 2 (Survey Mode)
+   - Enter test name (creates a RUN_<testname> folder under Results/)
    - Set sample interval (default: 2 seconds)
-   - Wait for network sanity check
    - Monitor live diagnostics
    - Type 'q' + Enter to stop
+
+## 📁 Folder Layout
+
+```
+Start WiFi Tool.command   ← double-click this to run
+README.md, LICENSE
+app/         ← all code + config (wl_tool12.py, wl_survey.py, wl_viewer.py, eero_devices.py, requirements.txt, setup.sh)
+floorplans/  ← default_floorplan.png + drop your own floor plans here
+docs/        ← guides (FAQ, FIELD_GUIDE, COMPARATIVE_TESTING_GUIDE, …)
+Results/     ← every RUN_/SURVEY_/COMPARATIVE output lands here (auto-created)
+```
 
 ## 📊 Output Files
 
@@ -119,10 +132,9 @@ Comparative mode enables production-grade testing by comparing a **Known Good Un
 
 ### How to Use
 
-1. **Start the tool and select mode 2**:
+1. **Start the tool and select mode 1, then Comparative**:
 ```bash
-sudo python3 wl_tool12.py
-Select test mode (1 or 2): 2
+sudo python3 app/wl_tool12.py
 ```
 
 2. **Phase 1: Test KGU**
