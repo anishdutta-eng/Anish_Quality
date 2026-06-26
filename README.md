@@ -20,6 +20,12 @@ This comprehensive diagnostic tool provides real-time wireless network analysis 
 - **NTF detection** - Differentiates true failures from No Trouble Found units
 - **Quality assurance** - Objective testing for manufacturing and RMA processes
 
+### 🗺️ Site Survey Mode (`wl_survey.py`)
+- **Interactive coverage heatmaps** - Load a floor plan, click measurement points, walk and measure, then generate smooth IDW-interpolated maps (RSSI / SNR / MCS / Tx Rate / PHY Rate / **4K-streaming readiness**)
+- **Band & channel annotation** - Every map labels the exact band and channel the survey ran on
+- **AP mount-type aware** - Ceiling vs table-top mount adjusts the radial coverage model (path-loss exponent and effective radius)
+- **4K Home-Performance model** - Each point is graded for *real-world* 4K (UHD = 25 Mbps) streaming readiness using a physically grounded link model: MCS capped to what the SNR can sustain, MIMO streams capped to SNR, throughput derated for packet loss at weak RSSI. A point is only "4K-capable" when it clears **both** ≥25 Mbps sustained throughput **and** the streaming RF floor (RSSI ≥ -67 dBm, SNR ≥ 25 dB); high-rate-but-weak-RF points are flagged "Marginal". This reflects what the link can *hold*, not its best-case burst.
+
 ### Core Diagnostics
 - **Real-time RSSI monitoring** with live graphing
 - **MCS Index tracking** for modulation analysis
