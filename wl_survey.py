@@ -911,28 +911,30 @@ def generate_survey_pdf(measurements, name, out_dir, output_pdf,
     # ---- Home / 4K streaming performance (feature 2) ----
     story.append(Paragraph("Home Performance — 4K Streaming Readiness", h2))
     story.append(Paragraph(
-        "Smooth 4K (UHD) video needs a sustained <b>25 Mbps</b>. We estimate the "
-        "achievable TCP throughput at each point as a function of RSSI, SNR, MCS "
-        "and NSS (PHY rate × efficiency × signal-reliability), then check it "
-        "against that 4K floor:", body))
+        "Smooth 4K (UHD) video needs a sustained <b>25 Mbps</b> AND a dependable "
+        "link. We estimate realistic sustained throughput from RSSI, SNR, MCS and "
+        "NSS — capping the modulation/spatial-streams to what the measured SNR can "
+        "actually hold and derating for packet loss at weak RSSI — then require the "
+        "RF reliability floor for streaming (RSSI \u2265 -67 dBm, SNR \u2265 25 dB):", body))
     tputs = [m.get("throughput") for m in measured if m.get("throughput") is not None]
     n_tput = len(tputs)
     if n_tput:
-        n_4k = sum(1 for t in tputs if t >= FOURK_MIN_MBPS)
+        # 4K-ready uses the gated verdict (throughput AND RF reliability), not raw rate.
+        ready = [m for m in measured if m.get("capable_4k")]
+        n_4k = len(ready)
         pct_4k = 100.0 * n_4k / n_tput
         avg_tput = sum(tputs) / n_tput
         min_tput = min(tputs)
         max_tput = max(tputs)
         story.append(Paragraph(
-            f"<b>{n_4k}/{n_tput}</b> measured points ({pct_4k:.0f}%) can stream 4K "
-            f"(\u2265 25 Mbps). Estimated throughput averages <b>{avg_tput:.0f} Mbps</b> "
-            f"(range {min_tput:.0f}–{max_tput:.0f} Mbps).", body))
-        if pct_4k < 100:
-            weak4k = [m for m in measured
-                      if m.get("throughput") is not None and m["throughput"] < FOURK_MIN_MBPS]
-            ids = ", ".join(f"#{m['point']}" for m in weak4k)
+            f"<b>{n_4k}/{n_tput}</b> measured points ({pct_4k:.0f}%) reliably support 4K "
+            f"(\u2265 25 Mbps with adequate signal). Estimated throughput averages "
+            f"<b>{avg_tput:.0f} Mbps</b> (range {min_tput:.0f}–{max_tput:.0f} Mbps).", body))
+        if n_4k < n_tput:
+            notready = [m for m in measured if not m.get("capable_4k")]
+            ids = ", ".join(f"#{m['point']}" for m in notready)
             story.append(Paragraph(
-                f"⚠ Points below the 4K floor: {ids}.", body))
+                f"⚠ Not reliable for 4K (low throughput or weak RSSI/SNR): {ids}.", body))
     else:
         story.append(Paragraph("No throughput estimates available.", body))
     story.append(Spacer(1, 0.15*inch))
