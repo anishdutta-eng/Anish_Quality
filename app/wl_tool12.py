@@ -945,163 +945,92 @@ def calculate_80211ax_phy_rate(mcs, nss, bw_mhz, gi_ns=800):
     return result
 
 
-# ===== HOME / 4K-STREAMING PERFORMANCE MODEL =====
-# A practical "good home WiFi" yardstick anchored to 4K (UHD) streaming, which
-# needs a sustained ~25 Mbps (Netflix 4K recommendation; industry "4K floor").
-#
-# Crucially, a link cannot sustain its momentarily-reported PHY rate when the RF
-# is weak. This model is grounded in published RF limits:
-#   * Each MCS requires a minimum SNR to be decoded reliably; you cannot hold a
-#     modulation your SNR doesn't support (Revolution-WiFi / mcsindex tables).
-#   * Each extra MIMO spatial stream needs substantially higher SNR (~+8-10 dB),
-#     so weak links collapse to a single stream.
-#   * Reliable streaming video needs RSSI >= -67 dBm; below -80 dBm links suffer
-#     heavy retransmission / packet loss (MetaGeek, NetSpot, IEEE 802.11ax data).
+# ===== DETERMINISTIC 4K-STREAMING CAPABILITY MODEL =====
+# Flawless 4K (UHD) streaming needs a sustained ~25-50 Mbps, which in turn
+# requires the WiFi LINK to clear well-established RF thresholds (widely published
+# streaming-grade guidance). Rather than fabricate a throughput number — which is
+# what a peak-PHY-rate estimate does, and why MCS 3 could falsely "pass" — we
+# evaluate the link directly against those thresholds and return a deterministic
+# 4K-capability verdict plus a graded 0-100 confidence index for visualisation.
 # Content rephrased for compliance with licensing restrictions.
-FOURK_MIN_MBPS = 25.0       # sustained throughput needed for smooth 4K (UHD)
-HOME_TARGET_MBPS = 150.0    # headroom target that maps to a top score / "excellent"
-
-# Reliable-streaming gates (a link must clear these to be called 4K-capable).
-STREAM_MIN_RSSI = -67.0     # dBm — minimum for dependable streaming video
-STREAM_MIN_SNR = 25.0       # dB  — needed to hold the higher MCS that give 4K headroom
-
-# Approximate minimum SNR (dB) required to *sustain* each 802.11ax MCS.
-# (Commonly published values; used to cap the reported MCS to what the measured
-# SNR can actually support.)
-_REQUIRED_SNR_FOR_MCS = {
-    0: 5, 1: 8, 2: 11, 3: 13, 4: 17, 5: 20,
-    6: 22, 7: 25, 8: 29, 9: 31, 10: 35, 11: 37,
-}
-
-def max_mcs_for_snr(snr):
-    """Highest 802.11ax MCS the given SNR (dB) can reliably sustain (0..11).
-
-    Returns -1 if SNR is too low to hold even MCS0 (no usable link).
-    """
-    if snr is None:
-        return 11  # unknown SNR: don't cap on this axis (RSSI gate still applies)
-    best = -1
-    for m, req in _REQUIRED_SNR_FOR_MCS.items():
-        if snr >= req:
-            best = max(best, m)
-    return best
-
-def _sustainable_nss(nss, snr):
-    """Spatial streams the link can actually carry given SNR.
-
-    MIMO spatial multiplexing needs strong SNR: a 2nd stream ~>=25 dB, a 3rd/4th
-    ~>=32 dB. Weak links fall back to a single stream.
-    """
-    nss = int(nss) if (nss and nss >= 1) else 1
-    if snr is None:
-        return nss
-    if snr >= 32:
-        return nss
-    if snr >= 25:
-        return min(nss, 2)
-    return 1
-
-def estimate_achievable_throughput(rssi, snr, mcs, nss, bw_mhz=80, gi_ns=800):
-    """Estimate realistic sustained TCP throughput (Mbps) from link metrics.
-
-    Steps (physically grounded, conservative):
-      1. Cap the reported MCS to what the measured SNR can sustain.
-      2. Cap spatial streams (NSS) to what the SNR supports (MIMO needs high SNR).
-      3. Compute the 802.11ax PHY rate from the *effective* MCS/NSS/BW/GI.
-      4. Apply MAC/TCP efficiency (~0.65) for goodput.
-      5. Derate for packet loss/retransmission driven by RSSI, plus a small
-         penalty when SNR only marginally clears the modulation's requirement.
-
-    Returns estimated Mbps (float), or None when inputs are insufficient.
-    """
-    if mcs is None or rssi is None:
-        return None
-
-    reported_mcs = int(round(mcs))
-    eff_mcs = min(reported_mcs, max_mcs_for_snr(snr))
-    if eff_mcs < 0:
-        return 0.0  # SNR too low to hold any modulation
-    eff_nss = _sustainable_nss(nss, snr)
-
-    calc = calculate_80211ax_phy_rate(eff_mcs, eff_nss, bw_mhz, gi_ns)
-    phy = calc.get('phy_rate_mbps') or 0.0
-    if phy <= 0:
-        return 0.0
-
-    efficiency = 0.65
-
-    # RSSI -> packet-delivery reliability (retransmissions rise sharply as signal
-    # weakens). >=-65 dBm clean; -80 dBm barely usable; below that almost nothing.
-    if rssi >= -65:
-        rssi_factor = 1.0
-    elif rssi >= -72:
-        rssi_factor = 0.5 + 0.5 * (rssi - (-72)) / 7.0          # -72..-65 -> 0.5..1.0
-    elif rssi >= -80:
-        rssi_factor = 0.1 + 0.4 * (rssi - (-80)) / 8.0          # -80..-72 -> 0.1..0.5
-    else:
-        rssi_factor = 0.05
-
-    # Small extra penalty if SNR only just clears the (already-capped) MCS need.
-    req = _REQUIRED_SNR_FOR_MCS.get(eff_mcs, 0)
-    margin = (snr - req) if snr is not None else 10.0
-    snr_margin_factor = max(0.5, min(1.0, 0.5 + 0.05 * margin))  # +10 dB margin -> 1.0
-
-    reliability = rssi_factor * snr_margin_factor
-    return round(phy * efficiency * reliability, 1)
+#
+# Hard gates (ALL must pass for a point to be called 4K-capable):
+#   * RSSI >= -65 dBm   signal strong enough for a stable, low-retry link
+#   * SNR  >= 25 dB     clean enough to hold high-order modulation
+#   * MCS  >= 5         256-QAM-class modulation actually in use
+# NSS does not gate (a single spatial stream can carry one 4K stream) but adds
+# headroom for multiple simultaneous streams.
+FOURK_MIN_MBPS = 25.0       # the 4K (UHD) bandwidth floor these thresholds support
+FOURK_RSSI_MIN = -65.0      # dBm
+FOURK_SNR_MIN = 25.0        # dB
+FOURK_MCS_MIN = 5           # 802.11 MCS index
+FOURK_PASS_SCORE = 60.0     # capability-index value that corresponds to "just clears all gates"
 
 
-def home_performance(rssi, snr, mcs, nss, bw_mhz=80, gi_ns=800):
-    """Grade a measurement for 'best home performance', anchored to 4K streaming.
+def fourk_capability(rssi, snr, mcs, nss=1):
+    """Deterministic 4K-streaming capability from link metrics.
 
-    A point is only called 4K-capable when it BOTH delivers >=25 Mbps of realistic
-    sustained throughput AND meets the reliable-streaming RF gates (RSSI/SNR),
-    because steady 4K needs dependable delivery, not just a peak rate.
+    No measurement and no fabricated Mbps: the verdict is a pure function of the
+    RF metrics against the published 4K thresholds.
+
+    A point is 4K-capable only when it clears ALL hard gates:
+        RSSI >= -65 dBm  AND  SNR >= 25 dB  AND  MCS >= 5.
 
     Returns a dict:
-      throughput_mbps : estimated realistic sustained TCP throughput
-      score           : 0-100 (60 == exactly the 25 Mbps 4K floor)
-      streams_4k      : simultaneous 25 Mbps 4K streams it can sustain
-      capable_4k      : bool — clears the throughput AND RF reliability gates
-      label           : short human-readable verdict
+      capable_4k : bool | None       (None when inputs are missing)
+      score      : 0-100 graded confidence index (60 == exactly clearing the
+                   gates; higher = more RF margin / headroom; <60 = below 4K)
+      label      : short human-readable verdict
+      gates      : {'rssi':bool,'snr':bool,'mcs':bool} which thresholds passed
     """
-    tput = estimate_achievable_throughput(rssi, snr, mcs, nss, bw_mhz, gi_ns)
-    if tput is None:
-        return {"throughput_mbps": None, "score": None, "streams_4k": None,
-                "capable_4k": None, "label": "no data"}
+    if rssi is None or snr is None or mcs is None:
+        return {"capable_4k": None, "score": None, "label": "no data",
+                "gates": {"rssi": None, "snr": None, "mcs": None}}
 
-    # RF reliability gate for dependable streaming.
-    rssi_ok = (rssi is not None and rssi >= STREAM_MIN_RSSI)
-    snr_ok = (snr is None or snr >= STREAM_MIN_SNR)
-    rf_reliable = rssi_ok and snr_ok
+    mcs = int(round(mcs))
+    nss = int(nss) if (nss and nss >= 1) else 1
 
-    capable = (tput >= FOURK_MIN_MBPS) and rf_reliable
-    streams = tput / FOURK_MIN_MBPS
+    # Hard gates — the published 4K-streaming thresholds.
+    g_rssi = rssi >= FOURK_RSSI_MIN
+    g_snr = snr >= FOURK_SNR_MIN
+    g_mcs = mcs >= FOURK_MCS_MIN
+    capable = g_rssi and g_snr and g_mcs
 
-    if tput <= 0:
-        score = 0.0
-    elif tput < FOURK_MIN_MBPS:
-        score = 60.0 * (tput / FOURK_MIN_MBPS)
-    else:
-        head = (tput - FOURK_MIN_MBPS) / (HOME_TARGET_MBPS - FOURK_MIN_MBPS)
-        score = 60.0 + 40.0 * max(0.0, min(1.0, head))
-    # If throughput looks fine but the RF is too weak for reliable streaming,
-    # cap the score below the 4K-pass line so the map doesn't over-promise.
-    if not rf_reliable:
-        score = min(score, 55.0)
+    # Graded confidence index: normalised margin of each metric around its
+    # threshold (0 at the threshold, +1 a comfortable margin above, negative
+    # below). Averaged and centred so that "just clears every gate" == 60.
+    n_rssi = (rssi - FOURK_RSSI_MIN) / 15.0     # +1 at -50 dBm, -1 at -80 dBm
+    n_snr = (snr - FOURK_SNR_MIN) / 15.0        # +1 at 40 dB,  -1 at 10 dB
+    n_mcs = (mcs - FOURK_MCS_MIN) / 5.0         # +1.2 at MCS 11, -1 at MCS 0
+    avg_n = (n_rssi + n_snr + n_mcs) / 3.0
+    score = FOURK_PASS_SCORE + 30.0 * avg_n
+    # NSS headroom: a small bump for 2+ spatial streams (more simultaneous 4K).
+    if nss >= 2:
+        score += 4.0 * min(nss - 1, 3)
+    score = max(0.0, min(100.0, score))
+    # Respect AND semantics: if any hard gate fails, the point cannot score as
+    # "passing" — clamp it below the 60 pass line regardless of the other metrics.
+    if not capable:
+        score = min(score, FOURK_PASS_SCORE - 5.0)
 
-    if tput >= FOURK_MIN_MBPS and not rf_reliable:
-        label = "Marginal (weak signal)"
-    elif not capable:
-        label = "Below 4K"
-    elif streams >= 4:
-        label = "Excellent (multi-4K)"
-    elif streams >= 2:
-        label = "Great (2+ 4K)"
-    else:
+    if not capable:
+        missing = []
+        if not g_rssi:
+            missing.append("RSSI")
+        if not g_snr:
+            missing.append("SNR")
+        if not g_mcs:
+            missing.append("MCS")
+        label = "Below 4K (" + "/".join(missing) + " too low)"
+    elif nss >= 2 and score >= 80:
+        label = "4K-ready (headroom for multiple streams)"
+    elif score >= 75:
         label = "4K-ready"
+    else:
+        label = "4K-capable (marginal)"
 
-    return {"throughput_mbps": tput, "score": round(score, 1),
-            "streams_4k": round(streams, 1), "capable_4k": capable, "label": label}
+    return {"capable_4k": capable, "score": round(score, 1), "label": label,
+            "gates": {"rssi": g_rssi, "snr": g_snr, "mcs": g_mcs}}
 
 
 def get_speedtest():

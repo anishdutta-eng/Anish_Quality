@@ -34,7 +34,8 @@ try:
         get_channel_utilization, get_bssid, get_ssid, get_wifi_channel,
         get_guard_interval, calculate_80211ax_phy_rate, estimate_distance,
         compute_network_score, refresh_wdutil_info,
-        estimate_achievable_throughput, home_performance, FOURK_MIN_MBPS,
+        fourk_capability, FOURK_MIN_MBPS,
+        FOURK_RSSI_MIN, FOURK_SNR_MIN, FOURK_MCS_MIN, FOURK_PASS_SCORE,
     )
     _HAVE_TOOL = True
 except Exception as e:
@@ -74,24 +75,26 @@ EKAHAU_PLOTLY = [
 ]
 
 
-# ===== 4K / HOME-PERFORMANCE COLOR MAP =====
-# For the estimated-throughput map the colour breakpoint sits at the 4K floor
-# (25 Mbps). With vmin=0 / vmax=100 Mbps, position 0.25 == 25 Mbps: red/orange
-# below it (cannot stream 4K), green above (4K-ready with headroom).
-FOURK_VMAX_MBPS = 100.0
-_fk = lambda mbps: max(0.0, min(1.0, mbps / FOURK_VMAX_MBPS))
-FOURK_CMAP = LinearSegmentedColormap.from_list("home4k", [
-    (0.00,            "#B00000"),  # 0 Mbps    — dead
-    (_fk(12),         "#FF2A00"),  # 12 Mbps   — very poor
-    (_fk(24.99),      "#FF7A00"),  # just under 4K floor — orange
-    (_fk(25),         "#FFD400"),  # 25 Mbps   — exactly the 4K floor (yellow)
-    (_fk(50),         "#9ACD32"),  # 50 Mbps   — comfortable
-    (_fk(75),         "#46C300"),  # 75 Mbps   — great
-    (1.00,            "#00A300"),  # >=100 Mbps — excellent headroom
+# ===== 4K CAPABILITY COLOR MAP =====
+# The 4K map shows a deterministic 0-100 capability index (not a fabricated
+# Mbps). The colour breakpoint sits at the pass line (score 60 == the link just
+# clears the RSSI/SNR/MCS 4K gates): red/orange below it (cannot stream 4K),
+# yellow at the line, green above (4K-ready with RF headroom).
+FOURK_VMIN = 0.0
+FOURK_VMAX = 100.0
+_fk = lambda s: max(0.0, min(1.0, s / FOURK_VMAX))
+FOURK_CMAP = LinearSegmentedColormap.from_list("fourk", [
+    (0.00,              "#B00000"),  # 0    — no chance
+    (_fk(30),           "#FF2A00"),  # 30   — very poor
+    (_fk(FOURK_PASS_SCORE - 0.01), "#FF7A00"),  # just under the pass line — orange
+    (_fk(FOURK_PASS_SCORE), "#FFD400"),         # 60 — exactly clears the 4K gates (yellow)
+    (_fk(75),           "#9ACD32"),  # 75   — comfortable margin
+    (_fk(90),           "#46C300"),  # 90   — great
+    (1.00,              "#00A300"),  # 100  — excellent headroom
 ])
 FOURK_PLOTLY = [
-    [0.00, "#B00000"], [_fk(12), "#FF2A00"], [_fk(24.99), "#FF7A00"],
-    [_fk(25), "#FFD400"], [_fk(50), "#9ACD32"], [_fk(75), "#46C300"],
+    [0.00, "#B00000"], [_fk(30), "#FF2A00"], [_fk(FOURK_PASS_SCORE - 0.01), "#FF7A00"],
+    [_fk(FOURK_PASS_SCORE), "#FFD400"], [_fk(75), "#9ACD32"], [_fk(90), "#46C300"],
     [1.00, "#00A300"],
 ]
 
@@ -352,12 +355,12 @@ def measure_point(samples=3, sample_delay=1.0):
     score, _ = compute_network_score(rssi=avg_rssi, snr=avg_snr, mcs=avg_mcs,
                                      tx_rate=avg_tx, phy_rate=phy_rate)
 
-    # Home / 4K-streaming performance: estimated achievable throughput from
-    # (RSSI, SNR, MCS, NSS) graded against the 25 Mbps 4K floor.
-    hp = home_performance(
+    # Home / 4K-streaming capability: deterministic verdict from (RSSI, SNR, MCS,
+    # NSS) against the published 4K thresholds. No measurement, no fabricated Mbps.
+    cap = fourk_capability(
         avg_rssi, avg_snr,
         int(round(avg_mcs)) if avg_mcs is not None else None,
-        nss_int, bw, gi)
+        nss_int)
 
     return {
         "rssi": avg_rssi,
@@ -367,11 +370,10 @@ def measure_point(samples=3, sample_delay=1.0):
         "channel_util": _avg(cu_vals),
         "phy_rate": phy_rate,
         "score": score,
-        "throughput": hp["throughput_mbps"],   # est. achievable Mbps (4K model)
-        "home_score": hp["score"],             # 0-100, 60 == 25 Mbps 4K floor
-        "streams_4k": hp["streams_4k"],        # simultaneous 25 Mbps 4K streams
-        "home_label": hp["label"],
-        "capable_4k": hp["capable_4k"],
+        "fourk_score": cap["score"],           # 0-100 capability index (60 == clears 4K gates)
+        "capable_4k": cap["capable_4k"],        # bool — clears RSSI/SNR/MCS 4K gates
+        "fourk_label": cap["label"],            # human verdict (e.g. "Below 4K (MCS too low)")
+        "fourk_gates": cap["gates"],            # which thresholds passed
         "phy_mode": str(phy) if phy else "",
         "nss": nss_int,
         "bw": bw,
@@ -644,10 +646,10 @@ def generate_heatmap(measurements, img, w_px, h_px, output_png,
         cmap = EKAHAU_CMAP
         vmin, vmax = 0, 100     # composite network performance score
         cbar_label = "Performance Score (0-100)"
-    elif metric == "throughput":
+    elif metric == "fourk_score":
         cmap = FOURK_CMAP
-        vmin, vmax = 0, FOURK_VMAX_MBPS   # 25 Mbps = 4K floor (yellow breakpoint)
-        cbar_label = "Est. Throughput (Mbps) — 4K needs \u2265 25"
+        vmin, vmax = FOURK_VMIN, FOURK_VMAX   # 0-100 capability index; 60 = pass line
+        cbar_label = "4K Capability (0-100) — pass \u2265 60"
     elif metric == "rssi":
         cmap = EKAHAU_CMAP
         vmin, vmax = -80, -45   # -45 dBm+ = best green, -80 dBm = dead red
@@ -672,13 +674,14 @@ def generate_heatmap(measurements, img, w_px, h_px, output_png,
     cf = ax.contourf(gx, gy, zi, levels=100, cmap=cmap, alpha=0.7,
                      vmin=vmin, vmax=vmax, zorder=1, extend="both")
 
-    # On the 4K map, draw the 25 Mbps boundary so the pass/fail line is explicit.
-    if metric == "throughput":
+    # On the 4K map, draw the pass line (capability score 60) so the 4K-capable
+    # boundary is explicit.
+    if metric == "fourk_score":
         try:
-            cs = ax.contour(gx, gy, zi, levels=[FOURK_MIN_MBPS],
+            cs = ax.contour(gx, gy, zi, levels=[FOURK_PASS_SCORE],
                             colors="#1A1A2E", linewidths=1.4, linestyles="--",
                             zorder=2)
-            ax.clabel(cs, fmt={FOURK_MIN_MBPS: "4K floor (25 Mbps)"}, fontsize=7)
+            ax.clabel(cs, fmt={FOURK_PASS_SCORE: "4K pass line"}, fontsize=7)
         except Exception:
             pass
 
@@ -908,35 +911,41 @@ def generate_survey_pdf(measurements, name, out_dir, output_pdf,
     story.append(bt)
     story.append(Spacer(1, 0.15*inch))
 
-    # ---- Home / 4K streaming performance (feature 2) ----
-    story.append(Paragraph("Home Performance — 4K Streaming Readiness", h2))
+    # ---- 4K streaming capability (deterministic, threshold-based) ----
+    story.append(Paragraph("4K Streaming Capability", h2))
     story.append(Paragraph(
-        "Smooth 4K (UHD) video needs a sustained <b>25 Mbps</b> AND a dependable "
-        "link. We estimate realistic sustained throughput from RSSI, SNR, MCS and "
-        "NSS — capping the modulation/spatial-streams to what the measured SNR can "
-        "actually hold and derating for packet loss at weak RSSI — then require the "
-        "RF reliability floor for streaming (RSSI \u2265 -67 dBm, SNR \u2265 25 dB):", body))
-    tputs = [m.get("throughput") for m in measured if m.get("throughput") is not None]
-    n_tput = len(tputs)
-    if n_tput:
-        # 4K-ready uses the gated verdict (throughput AND RF reliability), not raw rate.
-        ready = [m for m in measured if m.get("capable_4k")]
+        "Flawless 4K (UHD) streaming needs a sustained ~25 Mbps, which requires the "
+        "Wi-Fi link to clear well-established RF thresholds. Each point is judged "
+        "<b>deterministically</b> against these gates — there is no speed test and no "
+        "estimated throughput figure, so nothing is fabricated:", body))
+    story.append(Paragraph(
+        "&nbsp;&nbsp;• RSSI \u2265 -65 dBm &nbsp;&nbsp; • SNR \u2265 25 dB "
+        "&nbsp;&nbsp; • MCS \u2265 5 &nbsp;&nbsp;(NSS \u2265 1; extra streams add headroom)", body))
+    story.append(Paragraph(
+        "A point is 4K-capable only when it clears <b>all three</b> gates. The map "
+        "shows a 0-100 capability index where 60 means the link just clears the gates.", body))
+    caps = [m for m in measured if m.get("capable_4k") is not None]
+    n_cap_total = len(caps)
+    if n_cap_total:
+        ready = [m for m in caps if m.get("capable_4k")]
         n_4k = len(ready)
-        pct_4k = 100.0 * n_4k / n_tput
-        avg_tput = sum(tputs) / n_tput
-        min_tput = min(tputs)
-        max_tput = max(tputs)
+        pct_4k = 100.0 * n_4k / n_cap_total
         story.append(Paragraph(
-            f"<b>{n_4k}/{n_tput}</b> measured points ({pct_4k:.0f}%) reliably support 4K "
-            f"(\u2265 25 Mbps with adequate signal). Estimated throughput averages "
-            f"<b>{avg_tput:.0f} Mbps</b> (range {min_tput:.0f}–{max_tput:.0f} Mbps).", body))
-        if n_4k < n_tput:
-            notready = [m for m in measured if not m.get("capable_4k")]
+            f"<b>{n_4k}/{n_cap_total}</b> measured points ({pct_4k:.0f}%) are 4K-capable "
+            f"(clear all RF gates).", body))
+        notready = [m for m in caps if not m.get("capable_4k")]
+        if notready:
+            # Tally which gate fails most often for an actionable summary.
+            fail_rssi = sum(1 for m in notready if (m.get("fourk_gates") or {}).get("rssi") is False)
+            fail_snr = sum(1 for m in notready if (m.get("fourk_gates") or {}).get("snr") is False)
+            fail_mcs = sum(1 for m in notready if (m.get("fourk_gates") or {}).get("mcs") is False)
             ids = ", ".join(f"#{m['point']}" for m in notready)
             story.append(Paragraph(
-                f"⚠ Not reliable for 4K (low throughput or weak RSSI/SNR): {ids}.", body))
+                f"⚠ Not 4K-capable: {ids}. Failing-gate counts — "
+                f"RSSI &lt; -65 dBm: {fail_rssi}, SNR &lt; 25 dB: {fail_snr}, "
+                f"MCS &lt; 5: {fail_mcs}.", body))
     else:
-        story.append(Paragraph("No throughput estimates available.", body))
+        story.append(Paragraph("No 4K capability data available.", body))
     story.append(Spacer(1, 0.15*inch))
 
     # Key findings
@@ -969,7 +978,7 @@ def generate_survey_pdf(measurements, name, out_dir, output_pdf,
                  _row("MCS", "mcs", "", "{:.0f}"),
                  _row("Tx rate (Mbps)", "tx_rate", "Mbps", "{:.0f}"),
                  _row("PHY rate (Mbps)", "phy_rate", "Mbps", "{:.0f}"),
-                 _row("Est. 4K throughput (Mbps)", "throughput", "Mbps", "{:.0f}")]
+                 _row("4K capability (0-100)", "fourk_score", "", "{:.0f}")]
     st = Table(stat_rows, colWidths=[1.7*inch, 1.0*inch, 1.0*inch, 1.0*inch, 1.0*inch])
     st.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2C3E50")),
@@ -984,9 +993,9 @@ def generate_survey_pdf(measurements, name, out_dir, output_pdf,
     # ---- Heatmaps ----
     heatmap_paths = heatmap_paths or {}
     titles = {"score": "Network Performance Score",
-              "throughput": "Home Performance — 4K Streaming (\u2265 25 Mbps)",
+              "fourk_score": "4K Streaming Capability (pass \u2265 60)",
               "rssi": "RSSI Coverage", "mcs": "MCS Coverage"}
-    for key in ("score", "throughput", "rssi", "mcs"):
+    for key in ("score", "fourk_score", "rssi", "mcs"):
         p = heatmap_paths.get(key)
         if p and os.path.exists(p):
             story.append(PageBreak())
@@ -1046,12 +1055,14 @@ def generate_survey_pdf(measurements, name, out_dir, output_pdf,
         recs.append("AP is desk/table-top mounted — raising it higher or moving to a "
                     "ceiling/wall mount usually removes furniture shadow zones and "
                     "gives more uniform radial coverage.")
-    # 4K-specific recommendation
-    _t = [m.get("throughput") for m in measured if m.get("throughput") is not None]
-    if _t and any(t < FOURK_MIN_MBPS for t in _t):
-        recs.append("Some areas fall below the 25 Mbps 4K-streaming floor — consider "
-                    "a mesh node or a 5/6 GHz, wider-channel link to lift throughput "
-                    "in those zones.")
+    # 4K-specific recommendation (deterministic gate-based)
+    _caps = [m for m in measured if m.get("capable_4k") is not None]
+    _fail = [m for m in _caps if not m.get("capable_4k")]
+    if _caps and _fail:
+        recs.append(f"{len(_fail)} of {len(_caps)} points are not 4K-capable (fail the "
+                    "RSSI \u2265 -65 dBm / SNR \u2265 25 dB / MCS \u2265 5 gates) — add a mesh "
+                    "node or move to a 5/6 GHz, wider-channel link to lift those zones "
+                    "above the 4K threshold.")
     if not recs:
         recs.append("Coverage looks healthy. Re-survey periodically to catch drift.")
     for r in recs:
@@ -1076,7 +1087,7 @@ def generate_survey_pdf(measurements, name, out_dir, output_pdf,
 # Metric configs: key -> (label, colorscale_reversed, vmin, vmax, unit)
 _METRIC_CFG = {
     "score":      ("Performance",     False,   0, 100, ""),
-    "throughput": ("Home 4K Mbps",    False,   0, 100, "Mbps"),
+    "fourk_score":("4K Capability",   False,   0, 100, ""),
     "rssi":       ("RSSI",            False, -80, -45, "dBm"),
     "snr":        ("SNR",             False,  15,  35, "dB"),
     "mcs":        ("MCS Index",       False,   2,  11, ""),
@@ -1131,7 +1142,7 @@ def generate_interactive_html(measurements, img_path, w_px, h_px,
             grids[key] = {
                 "x": g[0], "y": g[1], "z": g[2],
                 "label": label, "vmin": vmin, "vmax": vmax, "unit": unit,
-                "colorscale": (FOURK_PLOTLY if key == "throughput" else EKAHAU_PLOTLY),
+                "colorscale": (FOURK_PLOTLY if key == "fourk_score" else EKAHAU_PLOTLY),
             }
 
     if not grids:
@@ -1143,7 +1154,7 @@ def generate_interactive_html(measurements, img_path, w_px, h_px,
         "point": m["point"], "x": m["x_px"], "y": m["y_px"],
         "rssi": m.get("rssi"), "snr": m.get("snr"), "mcs": m.get("mcs"),
         "tx_rate": m.get("tx_rate"), "phy_rate": m.get("phy_rate"),
-        "throughput": m.get("throughput"), "home_label": m.get("home_label"),
+        "fourk_score": m.get("fourk_score"), "fourk_label": m.get("fourk_label"),
     } for m in measurements]
 
     # Plotly.js source for offline embedding
@@ -1227,8 +1238,8 @@ function render() {
         'SNR: ' + (p.snr!=null?p.snr.toFixed(1)+' dB':'N/A') + '<br>' +
         'MCS: ' + (p.mcs!=null?p.mcs.toFixed(0):'N/A') + '<br>' +
         'Tx: ' + (p.tx_rate!=null?p.tx_rate.toFixed(0)+' Mbps':'N/A') + '<br>' +
-        'Home 4K: ' + (p.throughput!=null?p.throughput.toFixed(0)+' Mbps':'N/A') +
-        (p.home_label?' ('+p.home_label+')':'') +
+        '4K: ' + (p.fourk_score!=null?p.fourk_score.toFixed(0)+'/100':'N/A') +
+        (p.fourk_label?' ('+p.fourk_label+')':'') +
         '<extra></extra>'),
       showlegend: false,
     });
@@ -1447,7 +1458,7 @@ def _render_survey_outputs(measurements, fp, img, w_px, h_px, name, out_dir,
 
     print(f"\nGenerating heatmaps for '{name}'...")
     score_png = os.path.join(out_dir, f"heatmap_score_{name}.png")
-    home_png = os.path.join(out_dir, f"heatmap_home4k_{name}.png")
+    home_png = os.path.join(out_dir, f"heatmap_fourk_{name}.png")
     rssi_png = os.path.join(out_dir, f"heatmap_rssi_{name}.png")
     mcs_png = os.path.join(out_dir, f"heatmap_mcs_{name}.png")
     generate_heatmap(measurements, img, w_px, h_px, score_png,
@@ -1455,8 +1466,8 @@ def _render_survey_outputs(measurements, fp, img, w_px, h_px, name, out_dir,
                      ap_xy=ap_xy, planned_points=planned_points,
                      info_line=info_line, mount=mount)
     generate_heatmap(measurements, img, w_px, h_px, home_png,
-                     metric="throughput",
-                     title=f"Home Performance — 4K Streaming (\u2265 25 Mbps) — {name}",
+                     metric="fourk_score",
+                     title=f"4K Streaming Capability (pass \u2265 60) — {name}",
                      ap_xy=ap_xy, planned_points=planned_points,
                      info_line=info_line, mount=mount)
     generate_heatmap(measurements, img, w_px, h_px, rssi_png,
@@ -1475,7 +1486,7 @@ def _render_survey_outputs(measurements, fp, img, w_px, h_px, name, out_dir,
         measurements, name, out_dir,
         os.path.join(out_dir, f"survey_report_{name}.pdf"),
         ap_xy=ap_xy, planned_points=planned_points, meta=meta,
-        heatmap_paths={"score": score_png, "throughput": home_png,
+        heatmap_paths={"score": score_png, "fourk_score": home_png,
                        "rssi": rssi_png, "mcs": mcs_png})
 
     html_path = generate_interactive_html(
