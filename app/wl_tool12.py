@@ -2412,7 +2412,6 @@ def update_heatmap_plot(ax_heatmap, ax_coverage):
         
         max_dist = max(np.max(np.abs(xs)), np.max(np.abs(ys))) + margin
     else:
-        # STATIONARY MODE — extend radius to show all 3 coverage zones
         # STATIONARY MODE — show the area actually surveyed, not theoretical far-field.
         # Extrapolating out to 20m always invents weak signal at the edges even when
         # the user stayed in strong signal. Keep the radius close to where measurements
@@ -4027,7 +4026,6 @@ def plot_live_diagnostics(sample_interval):
         ax_mcs_p2.set_xlabel("Distance (m)", fontsize=12); ax_mcs_p2.set_ylabel("MCS Index", fontsize=12)
         ax_mcs_p2.set_ylim(-1, 13); ax_mcs_p2.grid(True, alpha=0.2); ax_mcs_p2.tick_params(labelsize=10)
         
-        # Bar chart placeholder
         ax_bar_p2.set_title("Nearby WiFi Networks by Band", fontsize=14, fontweight='bold', pad=12)
         ax_bar_p2.set_xlabel("Band", fontsize=12); ax_bar_p2.set_ylabel("Count", fontsize=12)
         ax_bar_p2.tick_params(labelsize=10)

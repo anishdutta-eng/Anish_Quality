@@ -722,7 +722,7 @@ def generate_heatmap(measurements, img, w_px, h_px, output_png,
 
     ax.set_title(title, fontsize=14, fontweight="bold", pad=26)
 
-    # Subtitle: frequency band / channel (feature 1) + AP mount caveat (feature 3)
+    # Subtitle: frequency band / channel + AP mount caveat
     sub_parts = []
     if info_line:
         sub_parts.append(info_line)
@@ -880,7 +880,7 @@ def generate_survey_pdf(measurements, name, out_dir, output_pdf,
         if sc_avg is not None else "No scored measurements collected.", body))
     story.append(Spacer(1, 0.1*inch))
 
-    # AP mount context (feature 3) — how to read the coverage shape.
+    # AP mount context — how to read the coverage shape.
     if meta.get("mount_note"):
         story.append(Paragraph(
             f"<i>AP mount: <b>{meta.get('mount_label', '—')}</b> — "
@@ -1448,7 +1448,7 @@ def _render_survey_outputs(measurements, fp, img, w_px, h_px, name, out_dir,
     """Render all heatmaps + JSON + interactive HTML + PDF for one measurement set."""
     meta = meta or {}
     mount = meta.get("mount")
-    # Band / channel + SSID line shown on top of every plot (feature 1).
+    # Band / channel + SSID line shown on top of every plot.
     info_bits = []
     if meta.get("band") and meta["band"] != "—":
         info_bits.append(meta["band"])
